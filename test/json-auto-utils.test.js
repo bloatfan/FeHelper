@@ -264,6 +264,19 @@ describe('json-auto-utils', () => {
         expect(utils.shouldUsePlainJsonView(Array.from({ length: 20001 }, (_, index) => index), 100)).toBe(true);
         expect(utils.shouldUsePlainJsonView({ payload: 'x' }, 2000001)).toBe(true);
     });
+
+    it('measures characters, nodes and depth for large JSON decisions', () => {
+        const value = {child: {child: {leaf: true}}};
+        const stats = utils.measureJsonComplexity(value, 123);
+        expect(stats.characters).toBe(123);
+        expect(stats.depth).toBeGreaterThanOrEqual(2);
+        expect(stats.nodes).toBeGreaterThan(0);
+        expect(stats.truncated).toBe(false);
+
+        const capped = utils.measureJsonComplexity({list: Array(10).fill(1)}, 10, {nodeLimit: 3});
+        expect(capped.truncated).toBe(true);
+        expect(capped.nodes).toBeGreaterThan(3);
+    });
 });
 
 describe('case-insensitive boolean tokens (#656)', () => {
@@ -279,5 +292,41 @@ describe('case-insensitive boolean tokens (#656)', () => {
     it('rejects identifiers and does not relax strict auto-detection of non-JSON', () => {
         expect(() => utils.parseWithBigInt('{"x":trueValue}')).toThrow();
         expect(() => utils.parseWithBigInt('{"x":FALSE_VALUE}')).toThrow();
+    });
+});
+
+describe('strict JSON fast path', () => {
+    it('parses plain strict JSON into ordinary values', () => {
+        expect(utils.parseWithBigInt('{"a":1,"b":["x",true,null]}')).toEqual({ a: 1, b: ['x', true, null] });
+    });
+
+    it('still promotes 16+ digit integers to BigInt', () => {
+        expect(utils.parseWithBigInt('{"id":1234567890123456789}').id).toBe(BigInt('1234567890123456789'));
+        expect(utils.parseWithBigInt('[1234567890123456789]')[0]).toBe(BigInt('1234567890123456789'));
+    });
+
+    it('still preserves integer-like keys (order and string type)', () => {
+        const value = utils.parseWithBigInt('{"2":"b","1":{"3":1234567890123456789}}');
+        expect(Object.keys(value).every((key) => typeof key === 'string')).toBe(true);
+        expect(value['3']).toBeUndefined();
+        // 数字键按原始顺序序列化，且内部标记不会泄漏给调用方
+        expect(utils.safeStringify(value)).toBe('{"2":"b","1":{"3":1234567890123456789}}');
+    });
+
+    it('still normalizes loose JSON that native JSON.parse rejects', () => {
+        expect(utils.parseWithBigInt("{name:'FeHelper', ok:True}")).toEqual({ name: 'FeHelper', ok: true });
+    });
+
+    it('keeps the legacy __BigInt__ marker handling when a marker is present', () => {
+        expect(utils.parseWithBigInt('{"x":"__BigInt__123"}').x).toBe(BigInt(123));
+    });
+
+    it('keeps every value of a strict document identical to JSON.parse', () => {
+        const source = JSON.stringify({
+            list: Array.from({ length: 100 }, (_, i) => ({ i, s: 'v' + i, ok: i % 2 === 0 })),
+            text: 'a,b:c "quoted" \\n',
+            empty: {}
+        }, null, 2);
+        expect(utils.parseWithBigInt(source)).toEqual(JSON.parse(source));
     });
 });

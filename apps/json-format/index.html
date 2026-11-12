@@ -355,6 +355,29 @@
                 </div>
             </div>
 
+            <div id="jsonMarkdownModal" class="jsonpath-modal" role="dialog" aria-modal="true" aria-labelledby="jsonMdTitle" v-show="mdPreview.visible" @click="closeMdPreview">
+                <div class="jsonpath-modal-content fh-md-modal-content" :class="{'is-wide': mdPreviewWide}" @click.stop>
+                    <div class="jsonpath-modal-header">
+                        <div class="fh-md-modal-heading">
+                            <h3 id="jsonMdTitle">Markdown 渲染</h3>
+                            <p><code class="fh-md-path" :title="mdPreview.path">{{mdPreview.path}}</code></p>
+                        </div>
+                        <div class="fh-md-modal-actions">
+                            <button type="button" class="xjf-btn fh-md-action fh-md-width-toggle" @click="toggleMdPreviewWidth" :aria-pressed="mdPreviewWide" :title="mdPreviewWide ? '恢复标准宽度' : '加宽到接近全屏'">{{mdPreviewWide ? '标准' : '宽屏'}}</button>
+                            <button type="button" class="xjf-btn fh-md-action" @click="toggleMdPreviewMode" :disabled="mdPreview.tooLarge">{{mdPreview.mode === 'source' ? '渲染' : '源码'}}</button>
+                            <button type="button" class="xjf-btn fh-md-action" @click="copyMdPreview" :disabled="!mdPreview.source">{{mdPreview.copied ? '已复制' : '复制源码'}}</button>
+                            <button type="button" class="jsonpath-modal-close" ref="mdModalClose" @click="closeMdPreview" aria-label="关闭">&times;</button>
+                        </div>
+                    </div>
+                    <div class="jsonpath-modal-body fh-md-modal-body">
+                        <p class="fh-md-notice" v-if="mdPreview.tooLarge">文本超过 {{mdPreviewMaxSource}} 字符，已切换为源码视图。</p>
+                        <div v-if="mdPreview.mode === 'preview'" class="fh-md-preview fh-inline-ai-markdown" v-html="mdPreviewHtml"></div>
+                        <pre v-else class="fh-md-source">{{mdPreview.source}}</pre>
+                        <p class="fh-md-empty" v-if="!mdPreview.source">当前节点没有可渲染的文本。</p>
+                    </div>
+                </div>
+            </div>
+
             <div id="jsonPathExamplesModal" class="jsonpath-modal" v-cloak v-show="showJsonPathExamplesModal" @click="closeJsonPathExamplesModal">
                 <div class="jsonpath-modal-content jsonpath-examples-modal" @click.stop>
                     <div class="jsonpath-modal-header">
@@ -440,6 +463,7 @@
         <script src="json-bigint.js"></script>
         <script src="json-auto-utils.js"></script>
         <script src="format-lib.js"></script>
+        <script src="../html2markdown/libs/marked.js"></script>
         <script src="json-abc.js"></script>
         <script src="json-decode.js"></script>
         <script src="../static/js/dark-mode.js"></script>

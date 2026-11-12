@@ -50,6 +50,16 @@ describe('json table view utils', () => {
         expect(canBuildTableViewData([{}, {}])).toBe(false);
     });
 
+    it('checks huge inputs structurally without materializing every cell', () => {
+        const rows = Array.from({ length: 20000 }, (_, index) => ({ index, name: 'user-' + index }));
+        const started = Date.now();
+        expect(canBuildTableViewData({ items: rows })).toBe(true);
+        expect(canBuildTableViewData(rows)).toBe(true);
+        expect(Date.now() - started).toBeLessThan(250);
+        // 只判断结构，不生成 2 万行 × 2 列的单元格
+        expect(buildRenderableTableViewData({ items: rows.slice(0, 2) }).rows).toHaveLength(2);
+    });
+
     it('throws when renderable table data would be empty', () => {
         expect(() => buildRenderableTableViewData({})).toThrow('没有可表格化的数据');
         expect(() => buildRenderableTableViewData([{}, {}])).toThrow('没有可表格化的数据');

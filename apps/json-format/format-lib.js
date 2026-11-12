@@ -97,12 +97,30 @@ window.Formatter = (function () {
     let cachedJsonString = '';
     let cachedJsonValue = null;
     const RAW_PARSE_FALLBACK_PREVIEW_LIMIT = 120000;
-    const LARGE_JSON_TEXT_THRESHOLD = 600000;
+    // 节点视图预算：先看节点数与层级，再看字符数。
+    // 文本型大 JSON（节点少、单值很长）不再被字符阈值一刀切。
+    const LARGE_JSON_AUTO_TREE_CHAR_LIMIT = 8000000;
+    const LARGE_JSON_AUTO_TREE_NODE_LIMIT = 4000;
+    const LARGE_JSON_DEPTH_LIMIT = 100;
+    const LARGE_JSON_ABSOLUTE_CHAR_LIMIT = 32000000;
+    const LARGE_JSON_ABSOLUTE_NODE_LIMIT = 2000000;
+    // 纯文本兜底视图只渲染前 200 万字符：完整字符串仍在内存里，
+    // 「复制」「下载」和 Ctrl+C 拿到的始终是全文，避免几十 MB 文本卡住排版。
+    const LARGE_JSON_PLAIN_PREVIEW_LIMIT = 2000000;
+    // 节点视图按需渲染：先铺开固定深度，其余节点在点击展开时再生成 DOM
+    const LAZY_TREE_CHILD_LIMIT = 200;
+    const LAZY_TREE_DEPTH_LIMIT = 2;
     let plainJsonViewEnabled = false;
     let largeJsonPlainViewEnabled = false;
     let largeJsonNodeViewEnabled = false;
+    let lazyTreeEnabled = false;
     let prettyJsonSelectionActive = false;
     let prettyJsonShortcutBound = false;
+    // 复杂度统计在一次格式化里会被多个判断复用，避免重复遍历整棵树
+    let complexityCache = null;
+    // #jfContent_pre 当前渲染的是哪一份字符串（同一引用时无需重写 DOM）
+    let jfPreSource = null;
+    let plainViewBannerEl = null;
     
     // 单例Worker实例
     let workerInstance = null;
@@ -218,6 +236,30 @@ window.Formatter = (function () {
         jfStatusBar && jfStatusBar.hide();
     };
 
+    // 纯文本视图按需写入 DOM：只渲染预览上限内的字符，完整内容仍在
+    // cachedJsonString 里，复制/下载走的都是全文。
+    let _buildPlainJsonPreview = function () {
+        let full = String(cachedJsonString || '');
+        if (full.length <= LARGE_JSON_PLAIN_PREVIEW_LIMIT) {
+            return {text: full, truncated: false, total: full.length};
+        }
+        return {
+            text: full.slice(0, LARGE_JSON_PLAIN_PREVIEW_LIMIT) +
+                '\n\n… 已截断预览：全文共 ' + full.length.toLocaleString() + ' 字符，完整内容请使用「复制」或「下载」。',
+            truncated: true,
+            total: full.length
+        };
+    };
+
+    let _syncPlainJsonPreview = function () {
+        if (!jfPre || !jfPre.length) return null;
+        if (jfPreSource === cachedJsonString) return null;
+        let preview = _buildPlainJsonPreview();
+        jfPre.text(preview.text);
+        jfPreSource = cachedJsonString;
+        return preview;
+    };
+
     let _setPlainJsonView = function (enabled) {
         if (largeJsonPlainViewEnabled && !enabled) {
             enabled = true;
@@ -228,6 +270,7 @@ window.Formatter = (function () {
             return;
         }
         if (plainJsonViewEnabled) {
+            _syncPlainJsonPreview();
             jfPre.show();
             jfContent.hide();
         } else {
@@ -239,7 +282,7 @@ window.Formatter = (function () {
 
     let _selectPrettyJsonText = function () {
         if (!_hasPrettyJsonResult()) return false;
-        jfPre.html(htmlspecialchars(cachedJsonString));
+        _syncPlainJsonPreview();
         _setPlainJsonView(true);
         let preEl = jfPre[0];
         if (!preEl || !window.getSelection || !document.createRange) return false;
@@ -343,10 +386,10 @@ window.Formatter = (function () {
             jsonSearchIndex = null;
             largeJsonPlainViewEnabled = false;
             largeJsonNodeViewEnabled = false;
-            pagedJsonViewEnabled = false;
-            pagedJsonNodes.clear();
             jfContent.html('').show();
             jfPre.html('').hide();
+            jfPreSource = null;
+            _removePlainViewBanner && _removePlainViewBanner();
             jfStatusBar && jfStatusBar.hide();
             formattingMsg.hide();
         } catch (e) {
@@ -659,10 +702,6 @@ window.Formatter = (function () {
     };
 
     let _getJsonPathKeys = function (curEl) {
-        if (pagedJsonViewEnabled) {
-            let entry = pagedJsonNodes.get(Number(curEl.attr('data-fh-lazy')));
-            if (entry) return entry.path;
-        }
         let keys = [];
         let current = curEl;
 
@@ -731,6 +770,67 @@ window.Formatter = (function () {
 
     let _getJsonPathForElement = function (curEl, language) {
         return _formatJsonPath(_getJsonPathKeys(curEl), language || 'javascript');
+    };
+
+    // 大 JSON 按需渲染：判断子节点是否应该延迟到展开时再生成
+    let _isLazyTreeNode = function (node) {
+        return lazyTreeEnabled && !!node &&
+            (node.type === 'object' || node.type === 'array') &&
+            node.depth >= LAZY_TREE_DEPTH_LIMIT;
+    };
+
+    let _lazyMoreHTML = function (start, total) {
+        return '<div class="item fh-lazy-more" data-lazy-start="' + start + '" data-lazy-total="' + total + '">' +
+            '<span class="fh-lazy-more-text">还有 ' + (total - start).toLocaleString() + ' 项，点击加载</span></div>';
+    };
+
+    // 展开一个延迟节点：从缓存值按路径取出子树，只生成这一层
+    let _expandLazyNode = function (el) {
+        let list = el.children('.kv-list.fh-lazy-children').first();
+        if (!list.length) return false;
+
+        let keys = _getJsonPathKeys(el);
+        let value = _getJsonValueByKeys(keys);
+        if (!value || typeof value !== 'object') return false;
+
+        let previousLazy = lazyTreeEnabled;
+        lazyTreeEnabled = true;
+        let node = createNode(value, keys.length);
+        let html = Array.isArray(value) ? node.getArrayChildrenHTML(0) : node.getObjectChildrenHTML(0);
+        lazyTreeEnabled = previousLazy;
+
+        list.removeClass('fh-lazy-children').html(html);
+        return true;
+    };
+
+    // 「还有 N 项」：继续追加下一批子节点
+    let _handleLazyMoreClick = function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        let more = $(this);
+        let container = more.parents('.item').first();
+        if (!container.length) {
+            more.remove();
+            return;
+        }
+
+        let start = parseInt(more.attr('data-lazy-start'), 10) || 0;
+        let keys = _getJsonPathKeys(container);
+        let value = _getJsonValueByKeys(keys);
+        if (!value || typeof value !== 'object') {
+            more.remove();
+            return;
+        }
+
+        let previousLazy = lazyTreeEnabled;
+        lazyTreeEnabled = true;
+        let node = createNode(value, keys.length);
+        let html = Array.isArray(value) ? node.getArrayChildrenHTML(start) : node.getObjectChildrenHTML(start);
+        lazyTreeEnabled = previousLazy;
+
+        more.before(html);
+        more.remove();
     };
 
     // 添加json路径
@@ -970,6 +1070,11 @@ window.Formatter = (function () {
         }
     };
 
+    // 字符串节点才适合做 Markdown 渲染
+    let _isMarkdownRenderableNode = function (el) {
+        return !!(el && el.length && el.children('.string').length);
+    };
+
     // 给某个节点增加操作项
     let _addOptForItem = function (el, show) {
         if (!statusBarEnabled && !largeJsonNodeViewEnabled) {
@@ -980,7 +1085,10 @@ window.Formatter = (function () {
         if (show) {
             let jfOptEl = el.children('.boxOpt');
             if (!jfOptEl.length) {
-                jfOptEl = $('<b class="boxOpt">' +
+                let markdownOpt = _isMarkdownRenderableNode(el)
+                    ? '<a class="opt-md" title="将当前节点文本按 Markdown 渲染">渲染</a>|'
+                    : '';
+                jfOptEl = $('<b class="boxOpt">' + markdownOpt +
                     '<a class="opt-copy" title="复制当前选中节点的JSON数据">复制</a>|' +
                     '<a class="opt-path" title="复制当前选中节点的 JSONPath">复制路径</a>|' +
                     '<a class="opt-download" target="_blank" title="下载当前选中节点的JSON数据">下载</a>|' +
@@ -992,6 +1100,36 @@ window.Formatter = (function () {
 
     };
 
+    // 把字符串节点交给工具页，由工具页负责 Markdown 渲染（format-lib 不依赖 Vue 与渲染库）
+    let _openMarkdownPreview = function (el) {
+        let info = _getSelectionInfo(el);
+        if (info.type !== 'string') {
+            toast('只有字符串节点支持 Markdown 渲染！');
+            return;
+        }
+
+        let source = '';
+        try {
+            source = JSON.parse(info.text);
+        } catch (e) {
+            source = el.children('.string').text() || '';
+        }
+        if (typeof source !== 'string') {
+            source = source === null || source === undefined ? '' : String(source);
+        }
+
+        try {
+            document.dispatchEvent(new window.CustomEvent('fh-json-markdown-preview', {
+                detail: {
+                    path: info.path,
+                    source: source
+                }
+            }));
+        } catch (e) {
+            toast('Markdown 预览打开失败！');
+        }
+    };
+
     let _handleNodeOptionClick = function (event) {
         event.preventDefault();
         event.stopPropagation();
@@ -999,6 +1137,11 @@ window.Formatter = (function () {
         let action = $(event.target);
         let el = action.closest('.item');
         if (!el.length) return;
+
+        if (action.hasClass('opt-md')) {
+            _openMarkdownPreview(el);
+            return;
+        }
 
         if (action.hasClass('opt-copy')) {
             _copyToClipboard(getJsonText(el));
@@ -1024,28 +1167,17 @@ window.Formatter = (function () {
                 ? el.parent('.item-array-container')
                 : null;
             let utils = window.FHJsonAutoUtils || {};
-            let deleted = false;
-            let entry = pagedJsonViewEnabled && pagedJsonNodes.get(Number(el.attr('data-fh-lazy')));
-            if (entry && entry.parent) {
-                if (Array.isArray(entry.parent)) entry.parent.splice(entry.key, 1);
-                else delete entry.parent[entry.key];
-                deleted = true;
-            } else if (cachedJsonValue !== null && typeof utils.deletePreservedValueAtPath === 'function') {
-                deleted = utils.deletePreservedValueAtPath(cachedJsonValue, _getJsonPathKeys(el));
-            }
-            if (deleted) {
+            if (
+                cachedJsonValue !== null &&
+                typeof utils.deletePreservedValueAtPath === 'function' &&
+                utils.deletePreservedValueAtPath(cachedJsonValue, _getJsonPathKeys(el))
+            ) {
                 cachedJsonString = _safeStringify(cachedJsonValue, 4);
-                jfPre.text(cachedJsonString);
+                jfPreSource = null;
+                complexityCache = null;
+                if (plainJsonViewEnabled) _syncPlainJsonPreview();
             }
             toast('节点已删除成功！');
-            if (pagedJsonViewEnabled) {
-                // Rebuild indices and discard stale page cursors after deletion.
-                _renderPagedJsonTree();
-                document.dispatchEvent(new window.CustomEvent('fh-json-result-change', {
-                    detail: {source: cachedJsonString}
-                }));
-                return;
-            }
             el.remove();
             if (
                 arrayContainer && arrayContainer.length &&
@@ -1225,8 +1357,7 @@ window.Formatter = (function () {
             return getJsonText(el);
         }
 
-        let entry = pagedJsonViewEnabled && pagedJsonNodes.get(Number(el.attr('data-fh-lazy')));
-        let value = entry ? entry.value : _getJsonValueByKeys(_getJsonPathKeys(el));
+        let value = _getJsonValueByKeys(_getJsonPathKeys(el));
         let text = _safeStringify(value, 4);
         return text === undefined ? '' : text;
     };
@@ -1343,9 +1474,8 @@ window.Formatter = (function () {
             query: jsonSearchState.query,
             total: jsonSearchState.matches.length,
             current: jsonSearchState.index >= 0 ? jsonSearchState.index + 1 : 0,
-            disabled: largeJsonPlainViewEnabled || pagedJsonViewEnabled,
-            reason: largeJsonPlainViewEnabled ? '大型 JSON 为完整文本视图，请使用浏览器查找' :
-                (pagedJsonViewEnabled ? '按需节点视图，请切换元数据后使用浏览器查找全文' : '')
+            disabled: largeJsonPlainViewEnabled,
+            reason: largeJsonPlainViewEnabled ? '大型 JSON 为完整文本视图，请使用浏览器查找' : ''
         };
     };
 
@@ -1381,7 +1511,7 @@ window.Formatter = (function () {
         query = String(query || '').trim();
         _clearJsonSearch();
 
-        if (largeJsonPlainViewEnabled || pagedJsonViewEnabled) {
+        if (largeJsonPlainViewEnabled) {
             jsonSearchState.query = query;
             return _getSearchResultState();
         }
@@ -1406,6 +1536,11 @@ window.Formatter = (function () {
 
         if (matches.length) {
             return _selectSearchMatch(0);
+        }
+
+        // 大 JSON 只加载了浅层节点，搜索范围要如实说明，避免误以为“全文无匹配”
+        if (jfContent.find('.fh-lazy').length) {
+            toast('当前只搜索了已展开的节点；可先展开更多节点再搜索。');
         }
 
         return _getSearchResultState();
@@ -1455,9 +1590,17 @@ window.Formatter = (function () {
                 // 只给没有id的节点分配唯一id，并生成注释
                 if (!el.attr('id')) {
                     el.attr('id', 'item' + (++lastItemIdGiven));
-                    let entry = pagedJsonViewEnabled && pagedJsonNodes.get(Number(el.attr('data-fh-lazy')));
-                    let count = entry ? (Array.isArray(entry.value) ? entry.value.length : Object.keys(entry.value).length) :
-                        el.children('.kv-list').eq(0).children().length;
+                    let listEl = el.children('.kv-list').eq(0);
+                    let count = listEl.children().length;
+                    let lazyTotal = parseInt(el.attr('data-lazy-total'), 10);
+                    let moreEl = listEl.children('.fh-lazy-more').first();
+                    if (moreEl.length) {
+                        let moreTotal = parseInt(moreEl.attr('data-lazy-total'), 10);
+                        if (isFinite(moreTotal)) lazyTotal = moreTotal;
+                    }
+                    if (isFinite(lazyTotal) && lazyTotal > count) {
+                        count = lazyTotal;
+                    }
                     let comment = count + (count === 1 ? ' item' : ' items');
                     jfStyleEl[0].insertAdjacentHTML(
                         'beforeend',
@@ -1484,8 +1627,7 @@ window.Formatter = (function () {
         if (plainJsonViewEnabled) {
             _setPlainJsonView(false);
         }
-        // Unloaded branches must keep their ellipsis until explicitly opened.
-        $('#jfContent .item-object:not([data-fh-lazy]), #jfContent .item-array:not([data-fh-lazy]), #jfContent .item-block:not([data-fh-lazy]), #jfContent [data-fh-loaded]').removeClass('collapsed');
+        $('#jfContent .item-object:not(.fh-lazy), #jfContent .item-array:not(.fh-lazy), #jfContent .item-block:not(.fh-lazy)').removeClass('collapsed');
         $('#optionBar .fh-json-collapse-toggle').text('折叠');
         jfStatusBar && jfStatusBar.hide();
     };
@@ -1561,10 +1703,15 @@ window.Formatter = (function () {
             ev.stopPropagation();
 
             let parentEl = $(this).parent();
-            if (pagedJsonViewEnabled && !parentEl.attr('data-fh-loaded')) {
-                _loadPagedJsonChildren(parentEl, 0);
+
+            if (parentEl.hasClass('fh-lazy')) {
+                parentEl.removeClass('collapsed');
+                if (_expandLazyNode(parentEl)) {
+                    parentEl.removeClass('fh-lazy');
+                }
                 return;
             }
+
             parentEl.toggleClass('collapsed');
 
             if (parentEl.hasClass('collapsed')) {
@@ -1572,18 +1719,13 @@ window.Formatter = (function () {
             }
         });
 
-        jfContent.on('click.fhJsonTree', '.fh-json-page, .fh-json-full-string', function(ev) {
+        jfContent.on('click.fhJsonTree', '.fh-lazy-more', _handleLazyMoreClick);
+
+        // 折叠状态下的按需节点：点省略号也能展开，不必精准点中小三角
+        jfContent.on('click.fhJsonTree', '.fh-lazy > .ellipsis', function (ev) {
             ev.preventDefault();
             ev.stopPropagation();
-            let button = $(this);
-            let el = button.closest('.item');
-            if (button.hasClass('fh-json-page')) {
-                _loadPagedJsonChildren(el, Number(button.attr('data-offset')));
-            } else {
-                let entry = pagedJsonNodes.get(Number(el.attr('data-fh-lazy')));
-                if (entry) el.children('.string').text(JSON.stringify(entry.value)).addClass('string-long');
-                button.remove();
-            }
+            $(this).parent().children('.expand').first().trigger('click');
         });
 
         jfContent.on('click.fhJsonTree', '.boxOpt a', _handleNodeOptionClick);
@@ -1592,6 +1734,9 @@ window.Formatter = (function () {
         jfContent.on('click.fhJsonTree', '.item', function (e) {
 
             let el = $(this);
+            if (el.hasClass('fh-lazy-more')) {
+                return;
+            }
 
             if (el.hasClass('x-selected')) {
                 _toogleStatusBar(el, false);
@@ -1834,6 +1979,7 @@ window.Formatter = (function () {
         cachedJsonString = raw;
         cachedJsonValue = null;
         jfPre.html(htmlspecialchars(previewRaw));
+        jfPreSource = cachedJsonString;
         jfContent.html(
             '<section class="fh-raw-source-fallback" role="region" aria-label="原文预览">' +
                 '<div class="fh-raw-source-fallback-head">' +
@@ -1848,147 +1994,79 @@ window.Formatter = (function () {
         );
     };
 
-    let _shouldUseLargeJsonPlainView = function(value, source) {
+    let _getJsonComplexity = function(value, sourceLength) {
         let utils = window.FHJsonAutoUtils || {};
-        if (typeof utils.shouldUsePlainJsonView === 'function') {
-            return utils.shouldUsePlainJsonView(value, String(source || '').length, {
-                characterLimit: LARGE_JSON_TEXT_THRESHOLD,
-                nodeLimit: 20000,
+        let length = Number(sourceLength);
+        if (!isFinite(length) || length < 0) {
+            length = String(cachedJsonString || '').length;
+        }
+        // 同一个值在同一次格式化里会被纯文本判断、按需渲染判断、预算判断各问一次，
+        // 遍历整棵树并不便宜，这里按引用缓存。
+        if (complexityCache && complexityCache.value === value && complexityCache.length === length) {
+            return complexityCache.stats;
+        }
+        let stats;
+        if (typeof utils.measureJsonComplexity === 'function') {
+            stats = utils.measureJsonComplexity(value, length, {
+                characterLimit: LARGE_JSON_ABSOLUTE_CHAR_LIMIT,
+                nodeLimit: LARGE_JSON_ABSOLUTE_NODE_LIMIT,
+                depthLimit: LARGE_JSON_DEPTH_LIMIT
             });
-        }
-        return String(source || '').length > LARGE_JSON_TEXT_THRESHOLD;
-    };
-
-    // Large trees are opened one level and one page at a time. Reuse the normal
-    // tree markup/actions; cachedJsonValue remains the source for copy/download.
-    const LARGE_JSON_PAGE_SIZE = 100;
-    const LARGE_JSON_STRING_PREVIEW = 2048;
-    let pagedJsonViewEnabled = false;
-    let pagedJsonNodes = new Map();
-    let pagedJsonNodeId = 0;
-
-    let _pagedJsonNodeHtml = function(value, path, key, arrayIndex, comma, parent) {
-        let id = ++pagedJsonNodeId;
-        pagedJsonNodes.set(id, {value, path, parent, key: arrayIndex === undefined ? key : arrayIndex});
-        let type = getType(value);
-        let container = type === 'array' || type === 'object';
-        let classes = 'item' + (container ? ' item-block collapsed' : ' item-line');
-        if (!path.length) classes += ' rootItem' + (container ? (type === 'array' ? ' item-array' : ' item-object') : '');
-        if (arrayIndex !== undefined) classes += ' item-array-element';
-        if (type === 'string' && shouldWrapLongString(value)) classes += ' item-line-wrap';
-        let html = '<div class="' + classes + '" data-fh-lazy="' + id + '"' +
-            (arrayIndex !== undefined ? ' data-array-index="' + arrayIndex + '"' : '') + '>';
-        if (container) html += '<span class="expand"></span>';
-        if (key !== undefined) {
-            html += '<span class="quote">"</span><span class="key">' +
-                htmlspecialchars(_normalizePreservedKey(key)) + '</span><span class="quote">"</span><span class="colon">: </span>';
-        }
-        if (container) {
-            html += '<span class="brace">' + (type === 'array' ? '[' : '{') + '</span>' +
-                '<span class="ellipsis"></span><div class="kv-list' + (type === 'array' ? ' item-array-container' : '') + '"></div>' +
-                '<span class="brace">' + (type === 'array' ? ']' : '}') + '</span>';
         } else {
-            // Do not recursively decode JSON-looking strings in this bounded view.
-            let preview = type === 'string' && value.length > LARGE_JSON_STRING_PREVIEW;
-            let previousEscape = escapeJsonStringEnabled;
-            try {
-                escapeJsonStringEnabled = false;
-                html += preview
-                    ? '<span class="string string-long">' + htmlspecialchars(JSON.stringify(value.slice(0, LARGE_JSON_STRING_PREVIEW))) + '</span>'
-                    : createNode(value).getHTML().replace(/^<div class="item item-line(?: item-line-wrap)?">/, '').replace(/<\/div>$/, '');
-            } finally {
-                escapeJsonStringEnabled = previousEscape;
-            }
-            if (preview) html += '<button class="xjf-btn fh-json-full-string" type="button">显示完整字符串（' + value.length + ' 字符）</button>';
+            stats = {characters: length, nodes: Infinity, depth: Infinity, truncated: true};
         }
-        return html + (comma ? '<span class="comma">,</span>' : '') + '</div>';
+        complexityCache = {value: value, length: length, stats: stats};
+        return stats;
     };
 
-    let _pagedJsonChildrenHtml = function(entry, offset) {
-        let value = entry.value;
-        let array = Array.isArray(value);
-        // Cache object keys only when this branch is opened; arrays need no key list.
-        if (!array && !entry.keys) entry.keys = Object.keys(value);
-        let count = array ? value.length : entry.keys.length;
-        offset = Math.max(0, Math.min(Math.floor(offset / LARGE_JSON_PAGE_SIZE) * LARGE_JSON_PAGE_SIZE,
-            Math.max(0, Math.ceil(count / LARGE_JSON_PAGE_SIZE) - 1) * LARGE_JSON_PAGE_SIZE));
-        let end = Math.min(count, offset + LARGE_JSON_PAGE_SIZE);
-        let html = '';
-        for (let index = offset; index < end; index++) {
-            let key = array ? index : entry.keys[index];
-            let pathKey = array ? '[' + index + ']' : _normalizePreservedKey(key);
-            html += _pagedJsonNodeHtml(value[key], entry.path.concat(pathKey), array ? undefined : key,
-                array ? index : undefined, index < count - 1, value);
-        }
-        if (count > LARGE_JSON_PAGE_SIZE) {
-            html += '<div class="fh-json-pages">';
-            for (const [label, start, disabled] of [
-                ['首页', 0, offset === 0], ['上一页', offset - LARGE_JSON_PAGE_SIZE, offset === 0],
-                ['下一页', end, end === count], ['末页', count - 1, end === count]
-            ]) {
-                html += '<button type="button" class="xjf-btn fh-json-page" data-offset="' + start + '"' +
-                    (disabled ? ' disabled' : '') + '>' + label + '</button>';
-            }
-            html += '<span> ' + (offset + 1) + '–' + end + ' / ' + count + ' 项</span></div>';
-        }
-        return html;
+    // 只有超出绝对预算（超大文本/极深嵌套）才退回纯文本；
+    // 节点多不再等于不能看，节点视图会按需渲染。
+    let _shouldUseLargeJsonPlainView = function(value, source) {
+        let stats = _getJsonComplexity(value, String(source || '').length);
+        if (stats.depth > LARGE_JSON_DEPTH_LIMIT) return true;
+        return stats.characters > LARGE_JSON_ABSOLUTE_CHAR_LIMIT ||
+            stats.nodes > LARGE_JSON_ABSOLUTE_NODE_LIMIT;
     };
 
-    let _loadPagedJsonChildren = function(el, offset) {
-        let entry = pagedJsonNodes.get(Number(el.attr('data-fh-lazy')));
-        if (!entry || !entry.value || typeof entry.value !== 'object') return;
-        let list = el.children('.kv-list');
-        list.find('[data-fh-lazy]').each(function() {
-            pagedJsonNodes.delete(Number($(this).attr('data-fh-lazy')));
-        });
-        list.html(_pagedJsonChildrenHtml(entry, offset));
-        el.attr('data-fh-loaded', '1').removeClass('collapsed');
-        jsonSearchIndex = null;
-        _clearJsonSearch();
-        _clearSelection();
+    let _shouldRenderLazyTree = function(value, source) {
+        let stats = _getJsonComplexity(value, String(source || '').length);
+        if (stats.depth > LARGE_JSON_DEPTH_LIMIT) return false;
+        if (stats.characters > LARGE_JSON_ABSOLUTE_CHAR_LIMIT || stats.nodes > LARGE_JSON_ABSOLUTE_NODE_LIMIT) return false;
+        return stats.nodes > LARGE_JSON_AUTO_TREE_NODE_LIMIT || stats.characters > LARGE_JSON_AUTO_TREE_CHAR_LIMIT;
     };
 
-    let _renderPagedJsonTree = function() {
-        if (!_canRenderFormattedResult()) return false;
-        pagedJsonNodes.clear();
-        pagedJsonNodeId = 0;
-        pagedJsonViewEnabled = true;
-        largeJsonPlainViewEnabled = false;
-        largeJsonNodeViewEnabled = true;
-        jfContent.html('<div id="formattedJson">' + _pagedJsonNodeHtml(cachedJsonValue, []) + '</div>');
-        let root = jfContent.find('[data-fh-lazy]').first();
-        _loadPagedJsonChildren(root, 0);
-        formattingMsg.hide();
-        _buildOptionBar();
-        _addEvents();
-        _downloadSupport(cachedJsonString);
-        $('<span class="fh-json-large-mode-note">按需节点视图 · 每页100项；全文查找请切换元数据</span>').prependTo('#optionBar');
-        $('#optionBar .fh-json-collapse-toggle').attr('title', '仅折叠或展开已加载节点，未加载分支请单独展开');
-        _emitFormatReady();
-        return true;
-    };
-
-    // Fully expanded rendering still obeys its original size/node/depth budget.
-    let _canRenderLargeJsonTree = function() {
-        let utils = window.FHJsonAutoUtils || {};
-        return typeof utils.shouldUsePlainJsonView === 'function' &&
-            !utils.shouldUsePlainJsonView(cachedJsonValue, cachedJsonString.length, {
-                characterLimit: 2000000,
-                nodeLimit: 20000,
-                depthLimit: 100,
-            });
+    // 节点视图预算：只要层级和绝对体量可接受，就允许按需渲染
+    let _canRenderLargeJsonTree = function(stats) {
+        stats = stats || _getJsonComplexity(cachedJsonValue, cachedJsonString.length);
+        return stats.depth <= LARGE_JSON_DEPTH_LIMIT &&
+            stats.nodes <= LARGE_JSON_ABSOLUTE_NODE_LIMIT &&
+            stats.characters <= LARGE_JSON_ABSOLUTE_CHAR_LIMIT;
     };
 
     let _renderLargeJsonTree = function() {
-        if (!_canRenderFormattedResult() || !_canRenderLargeJsonTree()) return false;
+        if (!_canRenderFormattedResult()) return false;
+        let stats = _getJsonComplexity(cachedJsonValue, cachedJsonString.length);
+        if (stats.depth > LARGE_JSON_DEPTH_LIMIT) {
+            toast('JSON 嵌套超过 ' + LARGE_JSON_DEPTH_LIMIT + ' 层，已保留完整文本，可复制或下载。');
+            return false;
+        }
+        if (!_canRenderLargeJsonTree(stats)) {
+            toast('数据量过大，已保留完整文本，可复制或下载全文。');
+            return false;
+        }
+
         let previousEscape = escapeJsonStringEnabled;
+        let previousLazy = lazyTreeEnabled;
         try {
             // Nested JSON strings remain strings: expanding them would bypass
             // the node/depth budget checked above.
             escapeJsonStringEnabled = false;
+            // 节点多时只铺开浅层，其余节点等用户展开时再生成
+            lazyTreeEnabled = true;
             let formattedJsonDiv = $('<div id="formattedJson"></div>');
             formattedJsonDiv.html(formatJsonToHtml(cachedJsonValue));
             jfContent.html(formattedJsonDiv);
+            _removePlainViewBanner();
             largeJsonPlainViewEnabled = false;
             // Explicitly opening the node view enables its actions for this result only.
             largeJsonNodeViewEnabled = true;
@@ -2004,6 +2082,7 @@ window.Formatter = (function () {
             return false;
         } finally {
             escapeJsonStringEnabled = previousEscape;
+            lazyTreeEnabled = previousLazy;
         }
     };
 
@@ -2013,7 +2092,7 @@ window.Formatter = (function () {
             return false;
         }
         formattingMsg.hide();
-        jfPre.text(cachedJsonString);
+        let preview = _syncPlainJsonPreview();
         jfContent.empty();
         _buildOptionBar();
         _downloadSupport(cachedJsonString);
@@ -2022,31 +2101,66 @@ window.Formatter = (function () {
         _clearJsonSearch();
         _setPlainJsonView(true);
         $('#optionBar .fh-json-meta-toggle, #optionBar .fh-json-collapse-toggle').hide();
-        $('<span class="fh-json-large-mode-note" title="大型 JSON 默认显示完整文本，可按需加载节点操作">大 JSON 文本视图</span>').prependTo('#optionBar');
+        let totalLength = String(cachedJsonString || '').length;
+        let truncated = !!(preview && preview.truncated);
+        // 顶部只放一个短标签，详细说明放到结果区横幅，避免把操作栏撑爆
+        $('<span class="fh-json-large-mode-note" title="' +
+            (truncated ? '为保持流畅，仅预览前 ' + LARGE_JSON_PLAIN_PREVIEW_LIMIT.toLocaleString() + ' 字符' : '数据量过大，已保留完整文本') +
+            '">' + (truncated ? '文本视图 · 已截断' : '文本视图') + '</span>').prependTo('#optionBar');
+        _renderPlainViewBanner(truncated, totalLength);
         if (_canRenderLargeJsonTree()) {
-            $('<button class="xjf-btn xjf-btn-mid fh-json-large-tree" title="加载节点以复制、查看路径、下载或删除；较大数据可能需要稍候">切换为节点视图</button>')
+            $('<button class="xjf-btn xjf-btn-mid fh-json-large-tree" title="按需加载节点视图；数据越大需要越久">切换为节点视图</button>')
                 .appendTo('#optionBar').bind('click', function(e) {
                     e.preventDefault();
                     e.stopPropagation();
                     _renderLargeJsonTree();
-                });
-        } else {
-            $('<button class="xjf-btn xjf-btn-mid fh-json-paged-tree" title="逐层展开，每页100项；复制与下载保留完整数据">切换为节点视图</button>')
-                .appendTo('#optionBar').bind('click', function(e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    _renderPagedJsonTree();
                 });
         }
         _emitFormatReady();
         return true;
     };
 
+    // 文本视图横幅：说明为什么不是节点视图，以及预览/全文的边界
+    let _removePlainViewBanner = function() {
+        if (plainViewBannerEl && plainViewBannerEl.parentNode) {
+            plainViewBannerEl.parentNode.removeChild(plainViewBannerEl);
+        }
+        plainViewBannerEl = null;
+    };
+
+    let _renderPlainViewBanner = function(truncated, totalLength) {
+        _removePlainViewBanner();
+        if (!jfPre || !jfPre.length || !jfPre[0] || !jfPre[0].parentNode) return;
+        if (typeof document === 'undefined' || !document.createElement) return;
+
+        let detail;
+        if (truncated) {
+            detail = '全文 ' + totalLength.toLocaleString() + ' 字符，为保持流畅仅预览前 ' +
+                LARGE_JSON_PLAIN_PREVIEW_LIMIT.toLocaleString() + ' 字符。「复制」「下载」和 Ctrl+C 得到的都是全文。';
+        } else if (!_canRenderLargeJsonTree()) {
+            detail = '已超出节点视图安全范围（200 万节点、3200 万字符或 100 层），已保留完整文本，可复制或下载。';
+        } else {
+            detail = '已保留完整文本，可复制或下载。';
+        }
+
+        let banner = document.createElement('div');
+        banner.id = 'fhJsonPlainBanner';
+        banner.className = 'fh-json-plain-banner';
+        banner.setAttribute('role', 'status');
+        banner.innerHTML = '<strong>大 JSON 文本视图</strong><span>' + htmlspecialchars(detail) + '</span>';
+        jfPre[0].parentNode.insertBefore(banner, jfPre[0]);
+        plainViewBannerEl = banner;
+    };
+
     /**
      * 执行代码格式化
      * 支持异步worker
+     * @param {string} jsonStr 已经是格式化结果时可直接复用，避免重复序列化
+     * @param {string} skin
+     * @param {boolean} escapeJsonString
+     * @param {*} parsedValue 调用方已经解析好的值；提供时跳过再次解析
      */
-    let format = async function (jsonStr, skin, escapeJsonString) {
+    let format = async function (jsonStr, skin, escapeJsonString, parsedValue) {
         const revision = _cancelPendingFormat();
         _initElements();
         
@@ -2057,11 +2171,15 @@ window.Formatter = (function () {
 
         try {
             // 先验证JSON是否有效（使用与worker一致的BigInt安全解析）
-            let parsedJson = _parseWithBigInt(jsonStr);
+            let parsedJson = parsedValue !== undefined ? parsedValue : _parseWithBigInt(jsonStr);
             cachedJsonValue = parsedJson;
-            // 使用replacer保证bigint与大数字不丢精度
-            cachedJsonString = _safeStringify(parsedJson, 4);
-            jfPre.html(htmlspecialchars(cachedJsonString));
+            // 使用replacer保证bigint与大数字不丢精度；
+            // 调用方已经序列化好时直接复用，省掉一次全量 stringify。
+            cachedJsonString = (parsedValue !== undefined && typeof jsonStr === 'string' && jsonStr)
+                ? jsonStr
+                : _safeStringify(parsedJson, 4);
+            jfPreSource = null;
+            complexityCache = null;
         } catch (e) {
             console.error('JSON解析失败:', e);
             _renderRawParseFallback(jsonStr, e);
@@ -2070,6 +2188,11 @@ window.Formatter = (function () {
 
         if (_shouldUseLargeJsonPlainView(cachedJsonValue, cachedJsonString)) {
             _renderLargeJsonPlainView();
+            return;
+        }
+
+        // 节点多但体量可控：直接走按需渲染，避免先落到纯文本视图
+        if (_shouldRenderLazyTree(cachedJsonValue, cachedJsonString) && _renderLargeJsonTree()) {
             return;
         }
 
@@ -2166,9 +2289,8 @@ window.Formatter = (function () {
             let parsedJson = _parseWithBigInt(jsonStr);
             cachedJsonValue = parsedJson;
             cachedJsonString = _safeStringify(parsedJson, 4);
-            
-            // 保留原始 JSON 内容，供旧 DOM 节点复用。
-            jfPre.html(htmlspecialchars(cachedJsonString));
+            jfPreSource = null;
+            complexityCache = null;
 
             if (_shouldUseLargeJsonPlainView(cachedJsonValue, cachedJsonString)) {
                 _renderLargeJsonPlainView();
@@ -2340,7 +2462,7 @@ window.Formatter = (function () {
 
     // 格式化JSON为HTML（同步版本）
     function formatJsonToHtml(json, skin) {
-        return createNode(json).getHTML();
+        return createNode(json, 0).getHTML();
     }
 
     function shouldWrapLongString(value) {
@@ -2349,10 +2471,11 @@ window.Formatter = (function () {
     }
 
     // 创建节点 - 直接复用webworker中的完整逻辑
-    function createNode(value) {
+    function createNode(value, depth) {
         let node = {
             type: getType(value),
             value: value,
+            depth: depth || 0,
             children: [],
             
             getHTML: function() {
@@ -2381,7 +2504,7 @@ window.Formatter = (function () {
                                         const parsed = JSON.parse(strValue);
                                         // 如果解析成功且是对象或数组，格式化显示
                                         if (typeof parsed === 'object' && parsed !== null) {
-                                            const nestedNode = createNode(parsed);
+                                            const nestedNode = createNode(parsed, this.depth + 1);
                                             // 获取嵌套JSON的完整HTML（完全展开）
                                             let nestedHTML = nestedNode.getHTML();
                                             // 移除外层的item容器div，只保留内部内容
@@ -2435,81 +2558,123 @@ window.Formatter = (function () {
                 if (!this.value || Object.keys(this.value).length === 0) {
                     return '<div class="item item-object"><span class="brace">{</span><span class="brace">}</span></div>';
                 }
-                
-                let html = '<div class="item item-object">' +
+
+                return '<div class="item item-object">' +
                     '<span class="expand"></span>' +
                     '<span class="brace">{</span>' +
                     '<span class="ellipsis"></span>' +
-                    '<div class="kv-list">';
-                    
+                    '<div class="kv-list">' + this.getObjectChildrenHTML(0) + '</div>' +
+                    '<span class="brace">}</span></div>';
+            },
+
+            getObjectChildrenHTML: function(start) {
+                start = start || 0;
                 let keys = Object.keys(this.value);
-                keys.forEach((key, index) => {
-                    let prop = this.value[key];
+                let end = lazyTreeEnabled ? Math.min(keys.length, start + LAZY_TREE_CHILD_LIMIT) : keys.length;
+                let html = '';
+                for (let index = start; index < end; index += 1) {
+                    let key = keys[index];
                     let displayKey = _normalizePreservedKey(key);
-                    let childNode = createNode(prop);
-                    // 判断子节点是否为对象或数组，决定是否加item-block
-                    let itemClass = (childNode.type === 'object' || childNode.type === 'array') ? 'item item-block' : 'item';
-                    html += '<div class="' + itemClass + '">';
-                    // 如果值是对象或数组，在key前面添加展开按钮
-                    if (childNode.type === 'object' || childNode.type === 'array') {
+                    let childNode = createNode(this.value[key], this.depth + 1);
+                    let isContainer = childNode.type === 'object' || childNode.type === 'array';
+                    let childLazy = _isLazyTreeNode(childNode);
+                    let itemClass = isContainer ? 'item item-block' : 'item';
+                    let lazyAttr = '';
+                    if (childLazy) {
+                        itemClass += ' collapsed fh-lazy';
+                        let childCount = Array.isArray(childNode.value)
+                            ? childNode.value.length
+                            : Object.keys(childNode.value || {}).length;
+                        lazyAttr = ' data-lazy-total="' + childCount + '"';
+                    }
+                    html += '<div class="' + itemClass + '"' + lazyAttr + '>';
+                    if (isContainer) {
                         html += '<span class="expand"></span>';
                     }
                     html += '<span class="quote">"</span>' +
                         '<span class="key">' + htmlspecialchars(displayKey) + '</span>' +
                         '<span class="quote">"</span>' +
                         '<span class="colon">: </span>';
-                    // 添加值
-                    if (childNode.type === 'object' || childNode.type === 'array') {
+                    if (childLazy) {
+                        html += childNode.getLazyInlineHTML();
+                    } else if (isContainer) {
                         html += childNode.getInlineHTMLWithoutExpand();
                     } else {
                         html += childNode.getHTML().replace(/^<div class="item item-line(?: item-line-wrap)?">/, '').replace(/<\/div>$/, '');
                     }
-                    // 如果不是最后一个属性，添加逗号
                     if (index < keys.length - 1) {
                         html += '<span class="comma">,</span>';
                     }
                     html += '</div>';
-                });
-                
-                html += '</div><span class="brace">}</span></div>';
+                }
+                if (lazyTreeEnabled && end < keys.length) {
+                    html += _lazyMoreHTML(end, keys.length);
+                }
                 return html;
             },
-            
+
             getArrayHTML: function() {
                 if (!this.value || this.value.length === 0) {
                     return '<div class="item item-array"><span class="brace">[</span><span class="brace">]</span></div>';
                 }
-                
-                let html = '<div class="item item-array">' +
+
+                return '<div class="item item-array">' +
                     '<span class="expand"></span>' +
                     '<span class="brace">[</span>' +
                     '<span class="ellipsis"></span>' +
-                    '<div class="kv-list item-array-container">';
-                    
-                this.value.forEach((item, index) => {
-                    let childNode = createNode(item);
-                    
-                    html += '<div class="item item-block item-array-element" data-array-index="' + index + '">';
-                    
-                    // 如果数组元素是对象或数组，在前面添加展开按钮
-                    if (childNode.type === 'object' || childNode.type === 'array') {
+                    '<div class="kv-list item-array-container">' + this.getArrayChildrenHTML(0) + '</div>' +
+                    '<span class="brace">]</span></div>';
+            },
+
+            getArrayChildrenHTML: function(start) {
+                start = start || 0;
+                let total = this.value.length;
+                let end = lazyTreeEnabled ? Math.min(total, start + LAZY_TREE_CHILD_LIMIT) : total;
+                let html = '';
+                for (let index = start; index < end; index += 1) {
+                    let childNode = createNode(this.value[index], this.depth + 1);
+                    let isContainer = childNode.type === 'object' || childNode.type === 'array';
+                    let childLazy = _isLazyTreeNode(childNode);
+                    let itemClass = 'item item-block item-array-element';
+                    let lazyAttr = '';
+                    if (childLazy) {
+                        itemClass += ' collapsed fh-lazy';
+                        let childCount = Array.isArray(childNode.value)
+                            ? childNode.value.length
+                            : Object.keys(childNode.value || {}).length;
+                        lazyAttr = ' data-lazy-total="' + childCount + '"';
+                    }
+                    html += '<div class="' + itemClass + '" data-array-index="' + index + '"' + lazyAttr + '>';
+                    if (isContainer) {
                         html += '<span class="expand"></span>';
+                    }
+                    if (childLazy) {
+                        html += childNode.getLazyInlineHTML();
+                    } else if (isContainer) {
                         html += childNode.getInlineHTMLWithoutExpand();
                     } else {
                         html += childNode.getHTML().replace(/^<div class="item item-line(?: item-line-wrap)?">/, '').replace(/<\/div>$/, '');
                     }
-                    
-                    // 如果不是最后一个元素，添加逗号
-                    if (index < this.value.length - 1) {
+                    if (index < total - 1) {
                         html += '<span class="comma">,</span>';
                     }
-                    
                     html += '</div>';
-                });
-                
-                html += '</div><span class="brace">]</span></div>';
+                }
+                if (lazyTreeEnabled && end < total) {
+                    html += _lazyMoreHTML(end, total);
+                }
                 return html;
             },
+
+            getLazyInlineHTML: function() {
+                let isArray = this.type === 'array';
+                let listClass = isArray ? 'kv-list item-array-container fh-lazy-children' : 'kv-list fh-lazy-children';
+                return '<span class="brace">' + (isArray ? '[' : '{') + '</span>' +
+                    '<span class="ellipsis"></span>' +
+                    '<div class="' + listClass + '"></div>' +
+                    '<span class="brace">' + (isArray ? ']' : '}') + '</span>';
+            },
+
             
             // 新增内联HTML方法，用于在同一行显示开始大括号/方括号
             getInlineHTML: function() {
@@ -2539,142 +2704,42 @@ window.Formatter = (function () {
                 if (!this.value || Object.keys(this.value).length === 0) {
                     return '<span class="brace">{</span><span class="brace">}</span>';
                 }
-                let html = '<span class="brace">{</span>' +
+                return '<span class="brace">{</span>' +
                     '<span class="expand"></span>' +
                     '<span class="ellipsis"></span>' +
-                    '<div class="kv-list">';
-                let keys = Object.keys(this.value);
-                keys.forEach((key, index) => {
-                    let prop = this.value[key];
-                    let displayKey = _normalizePreservedKey(key);
-                    let childNode = createNode(prop);
-                    // 判断子节点是否为对象或数组，决定是否加item-block
-                    let itemClass = (childNode.type === 'object' || childNode.type === 'array') ? 'item item-block' : 'item';
-                    html += '<div class="' + itemClass + '">';
-                    if (childNode.type === 'object' || childNode.type === 'array') {
-                        html += '<span class="expand"></span>';
-                    }
-                    html += '<span class="quote">"</span>' +
-                        '<span class="key">' + htmlspecialchars(displayKey) + '</span>' +
-                        '<span class="quote">"</span>' +
-                        '<span class="colon">: </span>';
-                    if (childNode.type === 'object' || childNode.type === 'array') {
-                        html += childNode.getInlineHTMLWithoutExpand();
-                    } else {
-                        html += childNode.getHTML().replace(/^<div class="item item-line(?: item-line-wrap)?">/, '').replace(/<\/div>$/, '');
-                    }
-                    if (index < keys.length - 1) {
-                        html += '<span class="comma">,</span>';
-                    }
-                    html += '</div>';
-                });
-                html += '</div><span class="brace">}</span>';
-                return html;
+                    '<div class="kv-list">' + this.getObjectChildrenHTML(0) + '</div>' +
+                    '<span class="brace">}</span>';
             },
             
             getInlineArrayHTML: function() {
                 if (!this.value || this.value.length === 0) {
                     return '<span class="brace">[</span><span class="brace">]</span>';
                 }
-                
-                let html = '<span class="brace">[</span>' +
+                return '<span class="brace">[</span>' +
                     '<span class="expand"></span>' +
                     '<span class="ellipsis"></span>' +
-                    '<div class="kv-list item-array-container">';
-                    
-                this.value.forEach((item, index) => {
-                    let childNode = createNode(item);
-                    
-                    html += '<div class="item item-block item-array-element" data-array-index="' + index + '">';
-                    
-                    // 如果数组元素是对象或数组，在前面添加展开按钮
-                    if (childNode.type === 'object' || childNode.type === 'array') {
-                        html += '<span class="expand"></span>';
-                        html += childNode.getInlineHTMLWithoutExpand();
-                    } else {
-                        html += childNode.getHTML().replace(/^<div class="item item-line(?: item-line-wrap)?">/, '').replace(/<\/div>$/, '');
-                    }
-                    
-                    // 如果不是最后一个元素，添加逗号
-                    if (index < this.value.length - 1) {
-                        html += '<span class="comma">,</span>';
-                    }
-                    
-                    html += '</div>';
-                });
-                
-                html += '</div><span class="brace">]</span>';
-                return html;
+                    '<div class="kv-list item-array-container">' + this.getArrayChildrenHTML(0) + '</div>' +
+                    '<span class="brace">]</span>';
             },
             
             getInlineObjectHTMLWithoutExpand: function() {
                 if (!this.value || Object.keys(this.value).length === 0) {
                     return '<span class="brace">{</span><span class="brace">}</span>';
                 }
-                let html = '<span class="brace">{</span>' +
+                return '<span class="brace">{</span>' +
                     '<span class="ellipsis"></span>' +
-                    '<div class="kv-list">';
-                let keys = Object.keys(this.value);
-                keys.forEach((key, index) => {
-                    let prop = this.value[key];
-                    let displayKey = _normalizePreservedKey(key);
-                    let childNode = createNode(prop);
-                    // 判断子节点是否为对象或数组，决定是否加item-block
-                    let itemClass = (childNode.type === 'object' || childNode.type === 'array') ? 'item item-block' : 'item';
-                    html += '<div class="' + itemClass + '">';
-                    if (childNode.type === 'object' || childNode.type === 'array') {
-                        html += '<span class="expand"></span>';
-                    }
-                    html += '<span class="quote">"</span>' +
-                        '<span class="key">' + htmlspecialchars(displayKey) + '</span>' +
-                        '<span class="quote">"</span>' +
-                        '<span class="colon">: </span>';
-                    if (childNode.type === 'object' || childNode.type === 'array') {
-                        html += childNode.getInlineHTMLWithoutExpand();
-                    } else {
-                        html += childNode.getHTML().replace(/^<div class="item item-line(?: item-line-wrap)?">/, '').replace(/<\/div>$/, '');
-                    }
-                    if (index < keys.length - 1) {
-                        html += '<span class="comma">,</span>';
-                    }
-                    html += '</div>';
-                });
-                html += '</div><span class="brace">}</span>';
-                return html;
+                    '<div class="kv-list">' + this.getObjectChildrenHTML(0) + '</div>' +
+                    '<span class="brace">}</span>';
             },
             
             getInlineArrayHTMLWithoutExpand: function() {
                 if (!this.value || this.value.length === 0) {
                     return '<span class="brace">[</span><span class="brace">]</span>';
                 }
-                
-                let html = '<span class="brace">[</span>' +
+                return '<span class="brace">[</span>' +
                     '<span class="ellipsis"></span>' +
-                    '<div class="kv-list item-array-container">';
-                    
-                this.value.forEach((item, index) => {
-                    let childNode = createNode(item);
-                    
-                    html += '<div class="item item-block item-array-element" data-array-index="' + index + '">';
-                    
-                    // 确保所有类型的数组元素都能正确处理
-                    if (childNode.type === 'object' || childNode.type === 'array') {
-                        html += '<span class="expand"></span>';
-                        html += childNode.getInlineHTMLWithoutExpand();
-                    } else {
-                        html += childNode.getHTML().replace(/^<div class="item item-line(?: item-line-wrap)?">/, '').replace(/<\/div>$/, '');
-                    }
-                    
-                    // 如果不是最后一个元素，添加逗号
-                    if (index < this.value.length - 1) {
-                        html += '<span class="comma">,</span>';
-                    }
-                    
-                    html += '</div>';
-                });
-                
-                html += '</div><span class="brace">]</span>';
-                return html;
+                    '<div class="kv-list item-array-container">' + this.getArrayChildrenHTML(0) + '</div>' +
+                    '<span class="brace">]</span>';
             }
         };
         

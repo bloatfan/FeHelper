@@ -52,6 +52,14 @@ export function createFormatPage() {
     vm.runInContext(readSource('apps/json-format/index.js').replace(/^import\s+[\s\S]*?from\s+['"][^'"]+['"];\s*/gm, ''), context);
     const app = {...config.data, $nextTick: callback => callback()};
     for (const [name, method] of Object.entries(config.methods)) app[name] = method.bind(app);
+    // 暴露 computed，便于测试依赖渲染结果的逻辑（例如 Markdown 预览）
+    for (const [name, getter] of Object.entries(config.computed || {})) {
+        Object.defineProperty(app, name, {
+            get: getter.bind(app),
+            enumerable: true,
+            configurable: true
+        });
+    }
     node('pageContainer').__vue__ = app;
     context.JsonEnDecode.urlDecodeByFetch = async source => source;
     const format = context.Formatter.format;

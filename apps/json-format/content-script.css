@@ -2474,3 +2474,51 @@ html.fh-jf body.theme-dark .boxOpt a:hover {
     padding-bottom: 20px;
 }
 
+
+/* ---------- 大 JSON 按需加载（折叠 / 还有 N 项） ---------- */
+html.fh-jf .item.fh-lazy {
+    cursor: pointer;
+}
+
+html.fh-jf .item.fh-lazy > .ellipsis {
+    color: #2563eb;
+    cursor: pointer;
+}
+
+html.fh-jf .item.fh-lazy-more {
+    color: #2563eb;
+    font-size: 12px;
+    line-height: 1.7;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+html.fh-jf .item.fh-lazy-more .fh-lazy-more-text {
+    display: inline-block;
+    padding: 1px 9px;
+    border: 1px dashed rgba(37, 99, 235, 0.4);
+    border-radius: 999px;
+    background: rgba(37, 99, 235, 0.06);
+}
+
+html.fh-jf .item.fh-lazy-more:hover .fh-lazy-more-text,
+html.fh-jf .item.fh-lazy-more:focus .fh-lazy-more-text {
+    border-color: rgba(37, 99, 235, 0.62);
+    background: rgba(37, 99, 235, 0.16);
+}
+
+html.fh-jf .theme-dark .item.fh-lazy > .ellipsis,
+html.fh-jf .theme-dark .item.fh-lazy-more {
+    color: #93b4ff;
+}
+
+html.fh-jf .theme-dark .item.fh-lazy-more .fh-lazy-more-text {
+    border-color: rgba(147, 180, 255, 0.42);
+    background: rgba(93, 141, 245, 0.14);
+}
+
+html.fh-jf .theme-dark .item.fh-lazy-more:hover .fh-lazy-more-text,
+html.fh-jf .theme-dark .item.fh-lazy-more:focus .fh-lazy-more-text {
+    background: rgba(93, 141, 245, 0.26);
+}

@@ -27,6 +27,42 @@ let FH_UI_MODE = 'FH_UI_MODE';
 let JSON_FORMAT_UI_MODE = 'JSON_FORMAT_UI_MODE';
 let formatRevision = 0;
 
+const MD_PREVIEW_MAX_SOURCE = 300000;
+const MD_PREVIEW_WIDE_KEY = 'jsonformat:md-preview-wide';
+
+// 大文档在 CodeMirror 里的性能开关：
+// 单行 6MB 的 JSON 开启 lineWrapping 时，仅排版就要 1s+；关掉换行后约 1/6。
+// 大文档也把“每次输入即格式化”改成防抖，避免敲一个字符就重排整棵树。
+const EDITOR_LARGE_DOC_THRESHOLD = 800000;
+const EDITOR_LARGE_FORMAT_DELAY = 400;
+let editorFormatTimer = null;
+
+function setEditorWrapMode(cm, isLarge) {
+    if (!cm || typeof cm.getOption !== 'function' || typeof cm.setOption !== 'function') return;
+    const wrap = !isLarge;
+    if (cm.getOption('lineWrapping') !== wrap) {
+        cm.setOption('lineWrapping', wrap);
+    }
+}
+
+function setEditorValue(text) {
+    const value = text === null || text === undefined ? '' : String(text);
+    if (!editor || typeof editor.setValue !== 'function') return;
+    setEditorWrapMode(editor, value.length > EDITOR_LARGE_DOC_THRESHOLD);
+    editor.setValue(value);
+}
+
+function createMarkdownPreviewState() {
+    return {
+        visible: false,
+        path: '',
+        source: '',
+        mode: 'preview',
+        tooLarge: false,
+        copied: false
+    };
+}
+
 const JSON_DERIVED_AI_TASKS = {
     structure: {
         taskKey: 'json-structure-health',
@@ -272,6 +308,9 @@ new Vue({
         tableViewColumns: [],
         tableViewRows: [],
         aiPanel: createInlineAiState(),
+        mdPreview: createMarkdownPreviewState(),
+        mdPreviewMaxSource: MD_PREVIEW_MAX_SOURCE,
+        mdPreviewWide: true,
         aiAvailability: createJsonAiAvailabilityState(),
         aiAvailabilityChecking: false,
         jsonPathExamples: [
@@ -307,6 +346,9 @@ new Vue({
         this.nestedEscapeParse = (this.safeGetLocalStorage('jsonformat:nested-escape-parse') === 'true');
         this.currentLayout = this.normalizeLayout(this.safeGetLocalStorage(LOCAL_KEY_OF_LAYOUT));
         this.windowNote = this.safeGetSessionStorage(JSON_WINDOW_NOTE) || '';
+        // 默认宽屏；用户手动切回标准后按存储的偏好来
+        const savedMdPreviewWide = this.safeGetLocalStorage(MD_PREVIEW_WIDE_KEY);
+        this.mdPreviewWide = savedMdPreviewWide === null ? true : savedMdPreviewWide === 'true';
         this.syncWindowNote();
         this.changeLayout(this.currentLayout);
         this.loadUiMode();
@@ -329,9 +371,25 @@ new Vue({
                 this.enterNodeEdit(jsonTxt);
             }
         };
-        editor.on('change', (editor, changes) => {
-            this.fireChange && this.format();
+        editor.on('change', () => {
+            const size = typeof editor.getValue === 'function' ? editor.getValue().length : 0;
+            setEditorWrapMode(editor, size > EDITOR_LARGE_DOC_THRESHOLD);
+            this.fireChange && this.scheduleEditorFormat(size);
         });
+
+        // 大段粘贴：先关掉换行再插入，避免 CodeMirror 为超长单行做整行换行排版
+        const cmWrapper = editor.getWrapperElement && editor.getWrapperElement();
+        if (cmWrapper && cmWrapper.addEventListener) {
+            cmWrapper.addEventListener('paste', (event) => {
+                const clipboard = event.clipboardData;
+                const text = clipboard && clipboard.getData ? clipboard.getData('text/plain') : '';
+                if (!text || text.length <= EDITOR_LARGE_DOC_THRESHOLD) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setEditorWrapMode(editor, true);
+                editor.replaceSelection(text, 'end', 'paste');
+            }, true);
+        }
 
         // 在tab创建或者更新时候，监听事件，看看是否有参数传递过来
         if (location.protocol === 'chrome-extension:') {
@@ -343,7 +401,9 @@ new Vue({
                     tabId: activeTab.id
                 }).then(resp => {
                     if(!resp || !resp.content) return ;
-                    editor.setValue(resp.content || '');
+                    this.fireChange = false;
+                    setEditorValue(resp.content || '');
+                    this.fireChange = true;
                     this.format();
                 });
             });
@@ -353,18 +413,32 @@ new Vue({
         this.loadPatchHotfix();
         this.handleInlineAiLaunch();
         document.addEventListener('fh-json-result-change', this.handleJsonResultChange);
+        document.addEventListener('fh-json-markdown-preview', this.handleJsonMarkdownPreview);
         document.addEventListener('keydown', this.handleGlobalKeydown, true);
         document.addEventListener('click', this.handleWindowNoteOutsideClick, true);
     },
     beforeDestroy: function () {
         document.removeEventListener('fh-json-result-change', this.handleJsonResultChange);
+        document.removeEventListener('fh-json-markdown-preview', this.handleJsonMarkdownPreview);
         document.removeEventListener('keydown', this.handleGlobalKeydown, true);
         document.removeEventListener('click', this.handleWindowNoteOutsideClick, true);
         window.clearTimeout(this.jsonPathCopyNoticeTimer);
+        if (editorFormatTimer !== null) {
+            window.clearTimeout(editorFormatTimer);
+            editorFormatTimer = null;
+        }
     },
     computed: {
         aiPanelResultHtml() {
             return renderInlineMarkdown(this.aiPanel.result);
+        },
+        mdPreviewHtml() {
+            try {
+                // 聊天/日志类文本依赖单个换行表达层次，这里按 GFM 换行规则渲染
+                return renderInlineMarkdown(this.mdPreview.source, {breaks: true});
+            } catch (e) {
+                return '';
+            }
         },
         jsonAiStatusText() {
             const state = this.aiAvailability || createJsonAiAvailabilityState();
@@ -399,13 +473,62 @@ new Vue({
             this.resetTableViewState();
         },
 
+        handleJsonMarkdownPreview: function(event) {
+            const detail = event && event.detail ? event.detail : {};
+            const source = typeof detail.source === 'string' ? detail.source : '';
+            const tooLarge = source.length > MD_PREVIEW_MAX_SOURCE;
+            this.mdPreview = {
+                visible: true,
+                path: detail.path || '',
+                source: source,
+                mode: tooLarge ? 'source' : 'preview',
+                tooLarge: tooLarge,
+                copied: false
+            };
+            this.$nextTick(() => {
+                const closeBtn = this.$refs && this.$refs.mdModalClose;
+                if (closeBtn && typeof closeBtn.focus === 'function') {
+                    closeBtn.focus();
+                }
+            });
+        },
+
+        closeMdPreview: function() {
+            this.mdPreview = createMarkdownPreviewState();
+        },
+
+        toggleMdPreviewMode: function() {
+            if (this.mdPreview.tooLarge && this.mdPreview.mode === 'source') {
+                return;
+            }
+            this.mdPreview.mode = this.mdPreview.mode === 'source' ? 'preview' : 'source';
+        },
+
+        toggleMdPreviewWidth: function() {
+            this.mdPreviewWide = !this.mdPreviewWide;
+            this.safeSetLocalStorage(MD_PREVIEW_WIDE_KEY, this.mdPreviewWide);
+        },
+
+        copyMdPreview: function() {
+            if (!this.mdPreview.source) return;
+            this.copyTextToClipboard(this.mdPreview.source).then(() => {
+                this.mdPreview.copied = true;
+                window.setTimeout(() => {
+                    this.mdPreview.copied = false;
+                }, 1600);
+            });
+        },
+
         handleGlobalKeydown(event) {
             if (!event || event.key !== 'Escape') {
                 return;
             }
 
             let handled = false;
-            if (this.windowNoteEditorOpen) {
+            if (this.mdPreview && this.mdPreview.visible) {
+                this.closeMdPreview();
+                handled = true;
+            } else if (this.windowNoteEditorOpen) {
                 this.closeWindowNoteEditor();
                 handled = true;
             } else if (this.aiPanel && this.aiPanel.visible) {
@@ -576,13 +699,14 @@ new Vue({
             this.tableViewMode = 'grid';
         },
 
-        syncResultActions(source, preserveToolbar = false) {
+        syncResultActions(source, preserveToolbar = false, parsedValue) {
             if (!preserveToolbar) this.resetResultActions();
             if (!source || this.errorMsg) {
                 return;
             }
             try {
-                const jsonObj = parseWithBigInt(source);
+                // 调用方已经解析过时直接复用，避免大 JSON 被重复解析一遍
+                const jsonObj = parsedValue !== undefined ? parsedValue : parseWithBigInt(source);
                 this.jsonActionReady = jsonObj !== null && typeof jsonObj === 'object';
                 this.tableViewReady = this.jsonActionReady && canBuildTableViewData(jsonObj);
                 this.setResultActionAvailability(this.jsonActionReady && !this.errorMsg);
@@ -895,7 +1019,7 @@ new Vue({
                 this.aiPanel.statusText = `AI 返回的 JSON 未通过本地解析校验：${error.message}`;
                 return;
             }
-            editor.setValue(fixedJson);
+            setEditorValue(fixedJson);
             this.format();
             this.aiPanel.statusText = '已写回输入框并重新格式化';
         },
@@ -1035,6 +1159,25 @@ new Vue({
             return (isUSTimeZone && isUSLanguage);
         },
 
+        // 编辑区内容变化后触发格式化：大文档防抖，普通文档保持即时反馈
+        scheduleEditorFormat: function (size) {
+            if (editorFormatTimer !== null) {
+                window.clearTimeout(editorFormatTimer);
+                editorFormatTimer = null;
+            }
+            const docSize = typeof size === 'number'
+                ? size
+                : (editor && typeof editor.getValue === 'function' ? editor.getValue().length : 0);
+            if (docSize <= EDITOR_LARGE_DOC_THRESHOLD) {
+                this.format();
+                return;
+            }
+            editorFormatTimer = window.setTimeout(() => {
+                editorFormatTimer = null;
+                this.format();
+            }, EDITOR_LARGE_FORMAT_DELAY);
+        },
+
         format: function () {
             this.errorMsg = '';
             this.jsonFormattedSource = '';
@@ -1117,7 +1260,7 @@ new Vue({
                         window.Formatter.setEscapeEnabled(false);
                     }
                     
-                    source = this.safeStringify(jsonObj);
+                    source = this.safeStringify(jsonObj, 4);
                 } catch (ex) {
                     // 通过JSON反解不出来的，一定有问题
                     this.errorMsg = ex.message;
@@ -1127,7 +1270,7 @@ new Vue({
                     // Plain rendering can finish synchronously before the first await.
                     this.placeHolder = '';
                     this.jsonFormattedSource = source;
-                    this.syncResultActions(source);
+                    this.syncResultActions(source, false, jsonObj);
 
                     const revision = formatRevision;
                     if (this.autoDecode) {
@@ -1147,7 +1290,7 @@ new Vue({
                         })();
                     } else {
                         (async () => {
-                            await Formatter.format(source, null, this.escapeJsonString);
+                            await Formatter.format(source, null, this.escapeJsonString, jsonObj);
                         })();
                     }
 
@@ -1207,7 +1350,7 @@ new Vue({
                 // CodeMirror emits change synchronously; publish the explicit result atomically.
                 this.fireChange = false;
                 try {
-                    editor.setValue(output);
+                    setEditorValue(output);
                 } finally {
                     this.fireChange = true;
                 }
@@ -1227,15 +1370,15 @@ new Vue({
         },
 
         uniEncode: function () {
-            editor.setValue(JsonEnDecode.uniEncode(editor.getValue()));
+            setEditorValue(JsonEnDecode.uniEncode(editor.getValue()));
         },
 
         uniDecode: function () {
-            editor.setValue(JsonEnDecode.uniDecode(editor.getValue()));
+            setEditorValue(JsonEnDecode.uniDecode(editor.getValue()));
         },
 
         urlDecode: function () {
-            JsonEnDecode.urlDecodeByFetch(editor.getValue()).then(text => editor.setValue(text));
+            JsonEnDecode.urlDecodeByFetch(editor.getValue()).then(text => setEditorValue(text));
         },
 
         updateWrapperHeight: function () {
@@ -1344,7 +1487,7 @@ new Vue({
         disableEditorChange: function (jsonTxt) {
             this.fireChange = false;
             this.$nextTick(() => {
-                editor.setValue(jsonTxt);
+                setEditorValue(jsonTxt);
                 this.$nextTick(() => {
                     this.fireChange = true;
                 })
@@ -1369,7 +1512,7 @@ new Vue({
 
         setDemo: function () {
             let demo = '{"BigIntSupported":995815895020119788889,"date":"20180322","url":"https://www.baidu.com?wd=fehelper","img":"http://gips0.baidu.com/it/u=1490237218,4115737545&fm=3028&app=3028&f=JPEG&fmt=auto?w=1280&h=720","message":"Success !","status":200,"city":"北京","count":632,"data":{"shidu":"34%","pm25":73,"pm10":91,"quality":"良","wendu":"5","ganmao":"极少数敏感人群应减少户外活动","yesterday":{"date":"21日星期三","sunrise":"06:19","high":"高温 11.0℃","low":"低温 1.0℃","sunset":"18:26","aqi":85,"fx":"南风","fl":"<3级","type":"多云","notice":"阴晴之间，谨防紫外线侵扰"},"forecast":[{"date":"22日星期四","sunrise":"06:17","high":"高温 17.0℃","low":"低温 1.0℃","sunset":"18:27","aqi":98,"fx":"西南风","fl":"<3级","type":"晴","notice":"愿你拥有比阳光明媚的心情"},{"date":"23日星期五","sunrise":"06:16","high":"高温 18.0℃","low":"低温 5.0℃","sunset":"18:28","aqi":118,"fx":"无持续风向","fl":"<3级","type":"多云","notice":"阴晴之间，谨防紫外线侵扰"},{"date":"24日星期六","sunrise":"06:14","high":"高温 21.0℃","low":"低温 7.0℃","sunset":"18:29","aqi":52,"fx":"西南风","fl":"<3级","type":"晴","notice":"愿你拥有比阳光明媚的心情"},{"date":"25日星期日","sunrise":"06:13","high":"高温 22.0℃","low":"低温 7.0℃","sunset":"18:30","aqi":71,"fx":"西南风","fl":"<3级","type":"晴","notice":"愿你拥有比阳光明媚的心情"},{"date":"26日星期一","sunrise":"06:11","high":"高温 21.0℃","low":"低温 8.0℃","sunset":"18:31","aqi":97,"fx":"西南风","fl":"<3级","type":"多云","notice":"阴晴之间，谨防紫外线侵扰"}]}}';
-            editor.setValue(demo);
+            setEditorValue(demo);
             this.$nextTick(() => {
                 this.format();
             })

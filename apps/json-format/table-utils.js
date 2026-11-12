@@ -109,11 +109,13 @@ export function buildRenderableTableViewData(input) {
     return tableViewData;
 }
 
+// 只做结构判断，不真正生成表格数据：大 JSON（几万行）如果每次格式化都
+// 把所有单元格 stringify 一遍，仅仅为了点亮一个按钮，代价太高。
 export function canBuildTableViewData(input) {
-    try {
-        buildRenderableTableViewData(input);
-        return true;
-    } catch (_) {
-        return false;
+    if (Array.isArray(input)) {
+        if (!input.length || !input.every(isPlainObject)) return false;
+        return input.some((row) => Object.keys(row).length > 0);
     }
+    if (!isPlainObject(input)) return false;
+    return Object.keys(input).length > 0;
 }

@@ -62,7 +62,7 @@ describe('json-format issue regressions', () => {
         expect(source).toContain('_ensureJsonSearchIndex()');
         expect(source).toContain('jsonSearchIndex.forEach(function (entry)');
         expect(source).toContain('_renderLargeJsonPlainView');
-        expect(source).toContain('shouldUsePlainJsonView');
+        expect(source).toContain('measureJsonComplexity');
         expect(source).toContain("jfContent.off('.fhJsonTree')");
         expect(source).toContain("jfContent.on('click.fhJsonTree', 'span.expand'");
         expect(source).toContain("jfContent.on('click.fhJsonTree', '.item'");
@@ -190,13 +190,15 @@ function createFormatPage() {
 }
 
 describe('large JSON page result lifecycle (#666 / #658)', () => {
-    const value = {payload: 'x'.repeat(600001), tail: ['complete']};
-    it.each([false, true])('renders full plaintext with autoDecode=%s', async autoDecode => {
+    const value = {items: Array.from({length: 5000}, (_, index) => index), tail: ['complete']};
+    it.each([false, true])('renders a lazy node tree with autoDecode=%s', async autoDecode => {
         const page = createFormatPage();
         page.app.autoDecode = autoDecode;
         expect(await page.format(JSON.stringify(value))).toBe(true);
-        expect(page.node('jfContent_pre').textContent).toBe(JSON.stringify(value, null, 4));
-        expect(page.node('jfContent_pre').style.display).not.toBe('none');
+        const html = page.node('jfContent').innerHTML;
+        expect(html).toContain('item-array');
+        expect(html).toContain('fh-lazy');
+        expect(page.node('jfContent_pre').style.display).toBe('none');
         expect(page.app.jsonActionReady).toBe(true);
     });
     it('renders beyond the node budget and clears stale plaintext on invalid or empty input', async () => {
@@ -205,7 +207,7 @@ describe('large JSON page result lifecycle (#666 / #658)', () => {
         page.app.jsonLintSwitch = false;
         for (const next of ['', '{bad:']) {
             expect(await page.format(JSON.stringify(array))).toBe(true);
-            expect(page.node('jfContent_pre').textContent).toBe(JSON.stringify(array, null, 4));
+            expect(page.node('jfContent').innerHTML).toContain('item-array');
             expect(await page.format(next)).toBe(false);
             expect(page.node('jfContent_pre').textContent).toBe('');
             expect(page.node('jfContent_pre').style.display).toBe('none');

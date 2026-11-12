@@ -17,7 +17,7 @@ function workerPage() {
     return {...page, workers};
 }
 
-const large = JSON.stringify({payload: 'x'.repeat(641056), tail: ['complete']});
+const large = JSON.stringify({items: Array.from({length: 5000}, (_, index) => index), tail: ['complete']});
 
 describe('#658: old Worker results must not replace a newer large JSON', () => {
     it('ignores queued completion and error events after switching to the full-text result', async () => {
@@ -31,10 +31,9 @@ describe('#658: old Worker results must not replace a newer large JSON', () => {
         onmessage({data: ['FORMATTED', '<div>OLD TREE</div>']});
         onerror(new Error('late failure'));
         await flush();
-        expect(page.node('jfContent_pre').textContent).toBe(JSON.stringify(JSON.parse(large), null, 4));
-        expect(page.node('jfContent_pre').style.display).not.toBe('none');
+        expect(page.node('jfContent').innerHTML).toContain('complete');
         expect(page.node('jfContent').innerHTML).not.toContain('OLD TREE');
-        expect(page.context.Formatter.isLargeJsonPlainViewEnabled()).toBe(true);
+        expect(page.context.Formatter.isLargeJsonPlainViewEnabled()).toBe(false);
     });
 
     it('keeps the timeout armed after a FORMATTING progress message', async () => {
@@ -58,8 +57,8 @@ describe('#658: old Worker results must not replace a newer large JSON', () => {
         await pending;
         await flush();
         expect(page.workers[0].terminated).toBe(true);
-        expect(page.node('jfContent_pre').style.display).not.toBe('none');
-        expect(page.node('jfContent_pre').textContent).toContain('complete');
+        expect(page.node('jfContent_pre').style.display).toBe('none');
+        expect(page.node('jfContent').innerHTML).toContain('complete');
     });
 });
 

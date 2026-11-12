@@ -199,16 +199,22 @@ function sanitizeInlineAiHtml(html) {
     return template.innerHTML;
 }
 
-function renderInlineMarkdown(content) {
+function renderInlineMarkdown(content, options) {
     const source = String(content || '');
     if (!source.trim()) return '';
 
     const markedApi = typeof globalThis !== 'undefined' ? globalThis.marked : null;
-    const html = typeof markedApi === 'function'
-        ? markedApi(source)
-        : markedApi && typeof markedApi.parse === 'function'
-            ? markedApi.parse(source)
-            : renderInlineMarkdownFallback(source);
+    // 默认按 CommonMark 处理（单个换行折叠为空格）；需要保留换行的场景
+    // （例如聊天/日志类 JSON 文本）可以传 {breaks: true}，与 GFM 的换行规则一致。
+    const markedOptions = options && options.breaks ? { breaks: true } : undefined;
+    let html;
+    if (typeof markedApi === 'function') {
+        html = markedOptions ? markedApi(source, markedOptions) : markedApi(source);
+    } else if (markedApi && typeof markedApi.parse === 'function') {
+        html = markedOptions ? markedApi.parse(source, markedOptions) : markedApi.parse(source);
+    } else {
+        html = renderInlineMarkdownFallback(source);
+    }
 
     return sanitizeInlineAiHtml(html);
 }

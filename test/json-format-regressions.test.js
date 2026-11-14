@@ -267,6 +267,57 @@ describe('tree data integrity', () => {
         expect(collapsed).toBe(false);
     });
 
+    it('JSON action bar keeps the collapse toggle and adds a separate expand-all button', () => {
+        const source = readSource('apps/json-format/format-lib.js');
+
+        // 原有折叠/展开切换保持不变
+        expect(source).toContain('fh-json-collapse-toggle');
+        expect(source).toContain("if (buttonCollapseAll.text() === '折叠')");
+        expect(source).toContain("$('#optionBar .fh-json-collapse-toggle').text('展开')");
+
+        // 全部展开是独立按钮，走包含按需节点的深展开
+        expect(source).toContain('fh-json-expand-all');
+        expect(source).toContain('>全部展开</button>');
+        expect(source).toContain('buttonExpandAll.bind');
+        expect(source).toContain('_expandAllJsonNodesDeep();');
+    });
+
+    it('expand-all re-renders the whole tree with on-demand rendering disabled', () => {
+        const source = readSource('apps/json-format/format-lib.js');
+        const start = source.indexOf('let _renderFullyExpandedJsonTree = function');
+        const end = source.indexOf('let _expandAllJsonNodesDeep', start);
+        let lazyDuringRender = null;
+        let escapeDuringRender = null;
+        let htmlWritten = false;
+        const sandbox = {
+            cachedJsonValue: {nested: {value: 1}},
+            lazyTreeEnabled: true,
+            escapeJsonStringEnabled: true,
+            largeJsonNodeViewEnabled: true,
+            jsonSearchIndex: [{stale: true}],
+            jfContent: { html() { htmlWritten = true; } },
+            $: () => ({ html() { return this; } }),
+            formatJsonToHtml() {
+                lazyDuringRender = sandbox.lazyTreeEnabled;
+                escapeDuringRender = sandbox.escapeJsonStringEnabled;
+                return '<div class="item item-object"></div>';
+            },
+            _clearJsonSearch() {},
+            _emitSelectionChange() {}
+        };
+        const rendered = vm.runInNewContext(
+            source.slice(start, end) + '\n_renderFullyExpandedJsonTree();',
+            sandbox
+        );
+        expect(rendered).toBe(true);
+        expect(htmlWritten).toBe(true);
+        expect(lazyDuringRender).toBe(false);
+        expect(sandbox.lazyTreeEnabled).toBe(true);
+        expect(escapeDuringRender).toBe(false);
+        expect(sandbox.escapeJsonStringEnabled).toBe(true);
+        expect(sandbox.jsonSearchIndex).toBeNull();
+    });
+
     it('#655: nested runner test_events survive worker tree formatting', () => {
         const value = {data: {runner: {test_events: [
             {name: 'first-event', payload: {steps: ['begin', 'end']}},

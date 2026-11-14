@@ -1632,6 +1632,58 @@ window.Formatter = (function () {
         jfStatusBar && jfStatusBar.hide();
     };
 
+    // 大 JSON 的按需视图只生成了浅层节点，是否还有未展开的延迟节点
+    let _hasLazyJsonNodes = function () {
+        return jfContent.find('.fh-lazy, .fh-lazy-more').length > 0;
+    };
+
+    // 放弃按需结构，一次性渲染完整节点树（所有层级、所有子项都展开）
+    let _renderFullyExpandedJsonTree = function () {
+        if (cachedJsonValue === null || cachedJsonValue === undefined) {
+            return false;
+        }
+        let previousLazy = lazyTreeEnabled;
+        let previousEscape = escapeJsonStringEnabled;
+        try {
+            lazyTreeEnabled = false;
+            // 大 JSON 节点视图为了预算禁用了嵌套字符串展开，这里保持一致
+            if (largeJsonNodeViewEnabled) {
+                escapeJsonStringEnabled = false;
+            }
+            let formattedJsonDiv = $('<div id="formattedJson"></div>');
+            formattedJsonDiv.html(formatJsonToHtml(cachedJsonValue));
+            jfContent.html(formattedJsonDiv);
+            jsonSearchIndex = null;
+            _clearJsonSearch();
+            _emitSelectionChange($());
+            return true;
+        } catch (e) {
+            return false;
+        } finally {
+            lazyTreeEnabled = previousLazy;
+            escapeJsonStringEnabled = previousEscape;
+        }
+    };
+
+    // 「全部展开」：连按需渲染的延迟节点也一起展开，不只是移除已有节点的折叠状态
+    let _expandAllJsonNodesDeep = function () {
+        if (plainJsonViewEnabled) {
+            _setPlainJsonView(false);
+        }
+        let fullyRendered = false;
+        if (_hasLazyJsonNodes()) {
+            fullyRendered = _renderFullyExpandedJsonTree();
+            if (!fullyRendered) {
+                toast('展开全部节点失败，已保留当前视图。');
+            }
+        }
+        if (!fullyRendered) {
+            $('#jfContent .item-object, #jfContent .item-array, #jfContent .item-block').removeClass('collapsed');
+        }
+        $('#optionBar .fh-json-collapse-toggle').text('折叠');
+        jfStatusBar && jfStatusBar.hide();
+    };
+
     /**
      * 创建几个全局操作的按钮，置于页面右上角即可
      * @private
@@ -1656,7 +1708,8 @@ window.Formatter = (function () {
 
         $('<span class="x-split">|</span>').appendTo(optionBar);
         let buttonFormatted = $('<button class="xjf-btn xjf-btn-left fh-json-meta-toggle">元数据</button>').appendTo(optionBar);
-        let buttonCollapseAll = $('<button class="xjf-btn xjf-btn-mid fh-json-collapse-toggle">折叠</button>').appendTo(optionBar);
+        let buttonCollapseAll = $('<button class="xjf-btn xjf-btn-mid fh-json-collapse-toggle" title="折叠所有节点">折叠</button>').appendTo(optionBar);
+        let buttonExpandAll = $('<button class="xjf-btn xjf-btn-mid fh-json-expand-all" title="展开全部节点（含按需加载节点）">全部展开</button>').appendTo(optionBar);
         let buttonCopyPlain = $('<button class="xjf-btn xjf-btn-mid fh-json-copy-plain" title="复制格式化后的 JSON 全文">复制</button>').appendTo(optionBar);
 
         buttonFormatted.bind('click', function (e) {
@@ -1687,6 +1740,12 @@ window.Formatter = (function () {
             } else {
                 _expandAllJsonNodes();
             }
+        });
+
+        buttonExpandAll.bind('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            _expandAllJsonNodesDeep();
         });
 
         _updatePlainJsonControls();
@@ -2100,7 +2159,7 @@ window.Formatter = (function () {
         largeJsonNodeViewEnabled = false;
         _clearJsonSearch();
         _setPlainJsonView(true);
-        $('#optionBar .fh-json-meta-toggle, #optionBar .fh-json-collapse-toggle').hide();
+        $('#optionBar .fh-json-meta-toggle, #optionBar .fh-json-collapse-toggle, #optionBar .fh-json-expand-all').hide();
         let totalLength = String(cachedJsonString || '').length;
         let truncated = !!(preview && preview.truncated);
         // 顶部只放一个短标签，详细说明放到结果区横幅，避免把操作栏撑爆

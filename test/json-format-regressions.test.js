@@ -318,6 +318,71 @@ describe('tree data integrity', () => {
         expect(sandbox.jsonSearchIndex).toBeNull();
     });
 
+    it('large clipboard copies use the async Clipboard API instead of textarea selection', async () => {
+        const source = readSource('apps/json-format/format-lib.js');
+        const start = source.indexOf('let _copyToClipboard = function');
+        const end = source.indexOf('/**', start);
+        let written = null;
+        let execCommandCalls = 0;
+        let toastText = '';
+        const sandbox = {
+            LARGE_CLIPBOARD_TEXT_THRESHOLD: 200000,
+            navigator: {
+                clipboard: {
+                    writeText(text) {
+                        written = text;
+                        return Promise.resolve();
+                    }
+                }
+            },
+            document: {
+                createElement() {
+                    execCommandCalls += 1;
+                    return {style: {}, select() {}};
+                },
+                body: {appendChild() {}, removeChild() {}},
+                execCommand() { return true; }
+            },
+            toast(message) { toastText = message; }
+        };
+        vm.runInNewContext(
+            source.slice(start, end) + "\n_copyToClipboard('x'.repeat(500000), '全文已复制');",
+            sandbox
+        );
+        await Promise.resolve();
+        expect(written).toHaveLength(500000);
+        expect(execCommandCalls).toBe(0);
+        expect(toastText).toBe('全文已复制');
+    });
+
+    it('small clipboard copies keep the textarea fallback', () => {
+        const source = readSource('apps/json-format/format-lib.js');
+        const start = source.indexOf('let _copyToClipboard = function');
+        const end = source.indexOf('/**', start);
+        let selected = 0;
+        let execCommandCalls = 0;
+        let toastText = '';
+        const sandbox = {
+            LARGE_CLIPBOARD_TEXT_THRESHOLD: 200000,
+            navigator: {clipboard: {writeText() { throw new Error('should not be used'); }}},
+            document: {
+                createElement() {
+                    return {style: {}, select() { selected += 1; }};
+                },
+                body: {appendChild() {}, removeChild() {}},
+                execCommand() { execCommandCalls += 1; return true; }
+            },
+            toast(message) { toastText = message; }
+        };
+        vm.runInNewContext(
+            source.slice(start, end) + "\n_copyToClipboard('hello', 'done');",
+            sandbox
+        );
+        expect(selected).toBe(1);
+        expect(execCommandCalls).toBe(1);
+        expect(toastText).toBe('done');
+    });
+
     it('#655: nested runner test_events survive worker tree formatting', () => {
         const value = {data: {runner: {test_events: [
             {name: 'first-event', payload: {steps: ['begin', 'end']}},

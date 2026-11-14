@@ -110,6 +110,8 @@ window.Formatter = (function () {
     // 节点视图按需渲染：先铺开固定深度，其余节点在点击展开时再生成 DOM
     const LAZY_TREE_CHILD_LIMIT = 200;
     const LAZY_TREE_DEPTH_LIMIT = 2;
+    // 超过该长度的复制改走异步剪贴板，避免 textarea.select() 阻塞主线程
+    const LARGE_CLIPBOARD_TEXT_THRESHOLD = 200000;
     let plainJsonViewEnabled = false;
     let largeJsonPlainViewEnabled = false;
     let largeJsonNodeViewEnabled = false;
@@ -655,16 +657,41 @@ window.Formatter = (function () {
      * @param text
      */
     let _copyToClipboard = function (text, successMsg) {
-        let input = document.createElement('textarea');
-        input.style.position = 'fixed';
-        input.style.opacity = 0;
-        input.value = text;
-        document.body.appendChild(input);
-        input.select();
-        document.execCommand('Copy');
-        document.body.removeChild(input);
+        let value = text === null || text === undefined ? '' : String(text);
+        let message = successMsg || 'Json片段复制成功，随处粘贴可用！';
 
-        toast(successMsg || 'Json片段复制成功，随处粘贴可用！')
+        // 兜底方案：老式 textarea + execCommand
+        let legacyCopy = function () {
+            let input = document.createElement('textarea');
+            input.style.position = 'fixed';
+            input.style.opacity = 0;
+            input.value = value;
+            document.body.appendChild(input);
+            input.select();
+            let copied;
+            try {
+                copied = document.execCommand('Copy');
+            } catch (e) {
+                copied = false;
+            }
+            document.body.removeChild(input);
+            if (!copied) {
+                toast('复制失败，请手动选择内容后复制。');
+                return;
+            }
+            toast(message);
+        };
+
+        // 大 JSON 优先走异步剪贴板：textarea.select() 在超大文本上会卡住主线程数秒
+        if (value.length >= LARGE_CLIPBOARD_TEXT_THRESHOLD &&
+            navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(value).then(function () {
+                toast(message);
+            }, legacyCopy);
+            return;
+        }
+
+        legacyCopy();
     };
 
 
@@ -2408,60 +2435,31 @@ window.Formatter = (function () {
             // 通过状态机跟踪是否在字符串内部
             let inString = false;
             let escape = false;
-            let marked = '';
-            
-            for (let i = 0; i < text.length; i++) {
-                const char = text[i];
-                
-                if (escape) {
-                    marked += char;
-                    escape = false;
-                    continue;
+            let cursor = 0;
+            let copied = 0;
+            let result = '';
+
+            // 只在非字符串上下文中替换大整数：一次线性扫描维护字符串状态
+            const bigintPattern = /([:,\[]\s*)(-?\d{16,})(\s*)(?=[,\]\}])/g;
+            let match;
+            while ((match = bigintPattern.exec(text)) !== null) {
+                while (cursor < match.index) {
+                    const char = text[cursor];
+                    cursor += 1;
+                    if (escape) {
+                        escape = false;
+                    } else if (char === '\\') {
+                        escape = true;
+                    } else if (char === '"') {
+                        inString = !inString;
+                    }
                 }
-                
-                if (char === '\\') {
-                    marked += char;
-                    escape = true;
-                    continue;
-                }
-                
-                if (char === '"') {
-                    inString = !inString;
-                    marked += char;
-                    continue;
-                }
-                
-                marked += char;
+                result += text.slice(copied, match.index);
+                result += inString ? match[0] : match[1] + '"__BigInt__' + match[2] + '"' + match[3];
+                copied = match.index + match[0].length;
             }
-            
-            // 只在非字符串上下文中替换大整数
-            // 使用更精确的正则，确保不在字符串内
-            const result = text.replace(/([:,\[]\s*)(-?\d{16,})(\s*)(?=[,\]\}])/g, function(match, prefix, number, spaces, offset) {
-                // 检查这个位置是否在字符串内
-                let inStr = false;
-                let esc = false;
-                for (let i = 0; i < offset; i++) {
-                    if (esc) {
-                        esc = false;
-                        continue;
-                    }
-                    if (text[i] === '\\') {
-                        esc = true;
-                        continue;
-                    }
-                    if (text[i] === '"') {
-                        inStr = !inStr;
-                    }
-                }
-                
-                // 如果在字符串内，不替换
-                if (inStr) {
-                    return match;
-                }
-                
-                return prefix + '"__BigInt__' + number + '"' + spaces;
-            });
-            
+            result += text.slice(copied);
+
             return JSON.parse(result, function(key, value) {
                 if (typeof value === 'string' && value.indexOf('__BigInt__') === 0) {
                     try {

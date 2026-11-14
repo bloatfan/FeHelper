@@ -103,35 +103,47 @@ const JSONBigInt = {
         // 这个正则匹配JSON中的数字，但需要避免匹配到引号内的字符串
         // 匹配模式: 找到数字前面是冒号或左方括号的情况（表示这是个值而不是键名）
         // 允许数字后面有可选的空白字符
-        return text.replace(
-            /([:,\[]\s*)(-?\d{16,})(\s*)(?=[,\]\}])/g, 
-            function(match, prefix, number, spaces, offset) {
-                // 检查这个位置是否在字符串内
-                let inStr = false;
-                let esc = false;
-                for (let i = 0; i < offset; i++) {
-                    if (esc) {
-                        esc = false;
-                        continue;
-                    }
-                    if (text[i] === '\\') {
-                        esc = true;
-                        continue;
-                    }
-                    if (text[i] === '"') {
-                        inStr = !inStr;
-                    }
+        const pattern = /([:,\[]\s*)(-?\d{16,})(\s*)(?=[,\]\}])/g;
+        let result = '';
+        let copied = 0;
+        let cursor = 0;
+        let inStr = false;
+        let esc = false;
+
+        // 单次线性扫描维护“是否在字符串内”，避免每个匹配点都从头扫描
+        function advanceTo(offset) {
+            while (cursor < offset) {
+                const char = text[cursor];
+                cursor += 1;
+                if (esc) {
+                    esc = false;
+                    continue;
                 }
-                
-                // 如果在字符串内，不替换
-                if (inStr) {
-                    return match;
+                if (char === '\\') {
+                    esc = true;
+                    continue;
                 }
-                
-                // 将大数字转换为特殊格式的字符串
-                return prefix + '"__BigInt__' + number + '"' + spaces;
+                if (char === '"') {
+                    inStr = !inStr;
+                }
             }
-        );
+        }
+
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+            advanceTo(match.index);
+            result += text.slice(copied, match.index);
+            if (inStr) {
+                // 如果在字符串内，不替换
+                result += match[0];
+            } else {
+                // 将大数字转换为特殊格式的字符串
+                result += match[1] + '"__BigInt__' + match[2] + '"' + match[3];
+            }
+            copied = match.index + match[0].length;
+        }
+        result += text.slice(copied);
+        return result;
     },
     
     // 恢复函数，将标记的BigInt字符串转回BigInt类型

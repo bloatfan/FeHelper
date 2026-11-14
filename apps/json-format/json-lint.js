@@ -619,33 +619,34 @@ let jsonlint = (function () {
 let lintDetect = function (sJson) {
     let result = {};
 
-    let isInsideDoubleQuotedString = function (text, offset) {
+    let quoteUnquotedKeysOutsideStrings = function (source) {
+        // 一次线性扫描维护字符串状态，避免每个匹配点都从头扫描（O(n×匹配数)）
+        const pattern = /([\s,{\[]+)([^,:\{\}\[\]\s'"]+)(\s*:)/gm;
+        let result = '';
+        let copied = 0;
+        let cursor = 0;
         let inString = false;
         let escaped = false;
-        for (let i = 0; i < offset; i++) {
-            let char = text[i];
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (char === '\\') {
-                escaped = true;
-                continue;
-            }
-            if (char === '"') {
-                inString = !inString;
-            }
-        }
-        return inString;
-    };
 
-    let quoteUnquotedKeysOutsideStrings = function (source) {
-        return source.replace(/([\s,{\[]+)([^,:\{\}\[\]\s'"]+)(\s*:)/gm, function ($0, $1, $2, $3, offset) {
-            if (isInsideDoubleQuotedString(source, offset)) {
-                return $0;
+        let match;
+        while ((match = pattern.exec(source)) !== null) {
+            while (cursor < match.index) {
+                const char = source[cursor];
+                cursor += 1;
+                if (escaped) {
+                    escaped = false;
+                } else if (char === '\\') {
+                    escaped = true;
+                } else if (char === '"') {
+                    inString = !inString;
+                }
             }
-            return $1 + '"' + $2 + '"' + $3;
-        });
+            result += source.slice(copied, match.index);
+            result += inString ? match[0] : match[1] + '"' + match[2] + '"' + match[3];
+            copied = match.index + match[0].length;
+        }
+        result += source.slice(copied);
+        return result;
     };
 
     let insertErrorFlag = function (s) {

@@ -94,41 +94,53 @@ export function getBigNumberDisplayString(value) {
     return rebuildBigNumberFromParts(value);
 }
 
-function isInsideQuotedSegment(text, offset) {
+// 用一次线性扫描维护引号状态，供所有匹配点复用。
+// 旧实现每个匹配点都从字符串开头扫一遍（O(n×匹配数)），1MB+ JSON 能卡住主线程数秒。
+function replaceOutsideQuotedSegments(text, regex, replacer) {
+    const hasGlobalFlag = regex.global;
+    const pattern = new RegExp(
+        regex.source,
+        hasGlobalFlag ? regex.flags : regex.flags + 'g'
+    );
+    let result = '';
+    let copied = 0;
+    let cursor = 0;
     let quote = '';
     let escaped = false;
 
-    for (let i = 0; i < offset; i++) {
-        const char = text[i];
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (char === '\\') {
-            escaped = true;
-            continue;
-        }
-        if (quote) {
-            if (char === quote) quote = '';
-            continue;
-        }
-        if (char === '"' || char === "'") {
-            quote = char;
+    function advanceTo(offset) {
+        while (cursor < offset) {
+            const char = text[cursor];
+            cursor += 1;
+            if (escaped) {
+                escaped = false;
+            } else if (char === '\\') {
+                escaped = true;
+            } else if (quote) {
+                if (char === quote) quote = '';
+            } else if (char === '"' || char === "'") {
+                quote = char;
+            }
         }
     }
 
-    return !!quote;
-}
-
-function replaceOutsideQuotedSegments(text, regex, replacer) {
-    return text.replace(regex, function () {
-        const args = Array.prototype.slice.call(arguments);
-        const offset = args[args.length - 2];
-        if (isInsideQuotedSegment(text, offset)) {
-            return args[0];
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+        advanceTo(match.index);
+        result += text.slice(copied, match.index);
+        if (quote) {
+            result += match[0];
+        } else {
+            const args = Array.prototype.slice.call(match);
+            args.push(match.index, text);
+            result += replacer.apply(null, args);
         }
-        return replacer.apply(null, args);
-    });
+        copied = match.index + match[0].length;
+        if (!hasGlobalFlag) break;
+        if (match[0] === '') pattern.lastIndex += 1;
+    }
+    result += text.slice(copied);
+    return result;
 }
 
 function normalizeLooseJSONSource(text) {
@@ -241,10 +253,10 @@ export function parseWithBigInt(text) {
     const ordered = markIntegerIndexKeys(fixed);
 
     // 3) 标记 16 位及以上的整数，确保不在字符串内部
-    const marked = ordered.replace(
+    const marked = replaceOutsideQuotedSegments(
+        ordered,
         /([:,\[]\s*)(-?\d{16,})(\s*)(?=[,\]\}])/g,
-        function (match, prefix, number, spaces, offset) {
-            if (isInsideQuotedSegment(ordered, offset)) return match;
+        function (match, prefix, number, spaces) {
             return prefix + '"__BigInt__' + number + '"' + spaces;
         },
     );
